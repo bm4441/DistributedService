@@ -1,0 +1,110 @@
+plugins {
+    alias(libs.plugins.android.application)
+    id 'com.google.protobuf'
+}
+
+android {
+    namespace 'com.zebra.ai.distributed'
+    compileSdk {
+        version = release(37) {
+            minorApiLevel = 1
+        }
+    }
+
+    defaultConfig {
+        applicationId "com.zebra.ai.distributed"
+        minSdk 33
+        //noinspection OldTargetApi
+        targetSdk 36
+        versionCode 1
+        versionName "1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildFeatures {
+        aidl true
+    }
+
+    buildTypes {
+        release {
+            optimization {
+                enable false
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    sourceSets {
+        main {
+            proto {
+                srcDir 'src/main/proto'
+            }
+            aidl {
+                srcDir 'src/main/aidl'
+            }
+            java {
+                srcDirs += 'build/generated/java/generateReleaseProto/java'
+                srcDirs += 'build/generated/java/generateReleaseProto/grpc'
+                srcDirs += 'build/generated/java/generateDebugProto/java'
+                srcDirs += 'build/generated/java/generateDebugProto/grpc'
+                srcDirs += 'build/generated/aidl_source_output_dir/release/out'
+            }
+        }
+    }
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:3.25.1"
+    }
+    plugins {
+        grpc {
+            artifact = "io.grpc:protoc-gen-grpc-java:1.62.2"
+        }
+    }
+    generateProtoTasks {
+        all().each { task ->
+            task.builtins {
+                java {
+                    option 'lite'
+                }
+            }
+            task.plugins {
+                grpc {
+                    option 'lite'
+                }
+            }
+        }
+    }
+}
+
+dependencies {
+    // Zebra AI Vision SDK -- provides the official INetworkInterfaceService/PeerInfo/
+    // DistinctTaskEnvelope/IPeerDiscoveryListener/ITaskResponseCallback contract classes
+    // (replacing our own hand-built copies) plus the on-device vision/inference engine,
+    // which will be wired up for actual processing later.
+    implementation files('libs/emc-ai-suite-release-4.1.0.aar')
+
+    // ocr.recognize's model, packaged as an asset-only AAR (empty classes.jar, just
+    // assets/text-ocr-recognizer/*.tar.crypt) -- TextOCR.Settings' constructor loads this
+    // eagerly, which is what LenderHandler.prepare() hits when warming this capability.
+    implementation files('libs/text-ocr-recognizer-2.10.1.aar')
+
+    implementation files('libs/product-and-shelf-recognizer-3.4.5.aar')
+
+    implementation libs.appcompat
+    implementation libs.material
+
+    implementation libs.grpc.okhttp
+    implementation libs.grpc.protobuf.lite
+    implementation libs.grpc.stub
+    implementation libs.javax.annotation.api
+
+    testImplementation libs.junit
+    androidTestImplementation libs.espresso.core
+    androidTestImplementation libs.ext.junit
+}

@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package com.zebra.ai.distributed;
+
+option java_multiple_files = true;
+option java_package = "com.zebra.ai.distributed";
+option java_outer_classname = "FileTransferProto";
+
+service FileTransferService {
+    rpc TransferFiles(stream FileChunk) returns (TransferResponse);
+}
+
+message FileMetadata {
+    string sender_serial = 1;
+    string file_name = 2;
+    int64 file_size = 3;
+    int32 file_index = 4;
+    int32 total_files = 5;
+}
+
+message FileChunk {
+    oneof data {
+        FileMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message TransferResponse {
+    bool success = 1;
+    string message = 2;
+}

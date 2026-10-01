@@ -1,0 +1,97 @@
+package com.zebra.ai.distributed;
+
+import android.util.Log;
+
+import java.util.List;
+
+/**
+ * Binder stub for INetworkInterfaceService, returned from DistributedService.onBind().
+ * Structure only for now -- each method just logs and returns a no-op default. The actual
+ * functionality (peer discovery, task dispatch, etc., calling into DistributedService's
+ * internals via mService) lands in a later change.
+ */
+final class NetworkInterfaceServiceImpl extends INetworkInterfaceService.Stub {
+
+    private static final String TAG = "DistributedService";
+
+    private final DistributedService mService;
+
+    NetworkInterfaceServiceImpl(DistributedService service) {
+        mService = service;
+    }
+
+    @Override
+    public void startPeerDiscovery(String capability, IPeerDiscoveryListener listener) {
+        Log.d(TAG, "startPeerDiscovery(capability=" + capability + ")");
+        mService.requestPeerDiscovery(capability, listener);
+    }
+
+    @Override
+    public void stopPeerDiscovery(String capability) {
+        Log.d(TAG, "stopPeerDiscovery(capability=" + capability + ")");
+        mService.stopPeerDiscovery(capability);
+    }
+
+    @Override
+    public int getPeerCount() {
+        int count = mService.getKnownPeers().size();
+        Log.d(TAG, "getPeerCount() -> " + count);
+        return count;
+    }
+
+    @Override
+    public List<PeerInfo> getConnectedPeers() {
+        List<PeerInfo> peers = mService.getKnownPeers();
+        Log.d(TAG, "getConnectedPeers() -> " + peers.size() + " peer(s)");
+        return peers;
+    }
+
+    @Override
+    public void getReadyPeers(List<PeerInfo> peers, String capability) {
+        Log.d(TAG, "getReadyPeers(capability=" + capability + ", " + peers.size() + " peer(s))");
+        mService.getReadyPeers(peers, capability);
+    }
+
+    @Override
+    public void registerDiscoveryListener(IPeerDiscoveryListener listener) {
+        Log.d(TAG, "registerDiscoveryListener()");
+        mService.registerDiscoveryListener(listener);
+    }
+
+    @Override
+    public void unregisterDiscoveryListener(IPeerDiscoveryListener listener) {
+        Log.d(TAG, "unregisterDiscoveryListener()");
+        mService.unregisterDiscoveryListener(listener);
+    }
+
+    @Override
+    public void submitDistinctTasks(List<DistinctTaskEnvelope> distinctTaskList,
+                                     ITaskResponseCallback callback) {
+        Log.d(TAG, "submitDistinctTasks(" + distinctTaskList.size() + " task(s))");
+        mService.submitDistinctTasks(distinctTaskList, callback);
+    }
+
+    @Override
+    public void submitTaskToPeer(String targetPeerId, DistinctTaskEnvelope task,
+                                  ITaskResponseCallback callback) {
+        Log.d(TAG, "submitTaskToPeer() not yet implemented");
+    }
+
+    @Override
+    public void sendResponseBackToRoot(DistinctTaskEnvelope resultEnvelope) {
+        Log.d(TAG, "sendResponseBackToRoot() not yet implemented");
+    }
+
+    @Override
+    public void cancelTaskGroup(String rootGroupId) {
+        Log.d(TAG, "cancelTaskGroup(rootGroupId=" + rootGroupId + ")");
+        mService.cancelTaskGroup(rootGroupId);
+    }
+
+    @Override
+    public String getLocalNodeId() {
+        String nodeId = mService.getLocalSerialNumber();
+        Log.d(TAG, "getLocalNodeId() -> " + nodeId);
+        return nodeId;
+    }
+}
