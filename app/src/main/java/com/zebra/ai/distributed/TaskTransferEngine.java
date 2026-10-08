@@ -460,9 +460,15 @@ final class TaskTransferEngine {
                             + "' was released; dropping taskId=" + envelope.taskId);
                     return;
                 }
-                response = handler.handle(request);
+                svc.mInferenceMeter.begin();
+                try {
+                    response = handler.handle(request);
+                } finally {
+                    svc.mInferenceMeter.end();
+                }
             }
             long processingMillis = SystemClock.uptimeMillis() - processStartMillis;
+            svc.mInferenceMeter.taskDone(processingMillis);
             long processingCount = mProcessingCount.incrementAndGet();
             long totalProcessingMillis = mTotalProcessingMillis.addAndGet(processingMillis);
             long avgProcessingMillis = totalProcessingMillis / processingCount;

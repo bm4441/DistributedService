@@ -20,6 +20,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -235,6 +236,12 @@ final class PeerReadinessEngine {
      * TaskTransferEngine.ensurePeerWorker()), which will carry the distinct tasks sent to it.
      */
     void getReadyPeers(java.util.List<PeerInfo> peers, String capability) {
+        // Each peer once: the list can hold the same peer more than once (PeerInfo has no equals(), so its peerId is what
+        // tells), and it must not be sent a second ready check. The first one stays and the order is kept; a peer with no
+        // peerId is left for the loop below to skip.
+        Set<String> seenPeerIds = new HashSet<>();
+        peers.removeIf(peer -> peer.peerId != null && !seenPeerIds.add(peer.peerId));
+
         for (PeerInfo peer : peers) {
             if (peer.peerId == null) {
                 EventLog.w(TAG, "Skipping a peer with no peerId in getReadyPeers(capability=" + capability + ")");
@@ -546,7 +553,12 @@ final class PeerReadinessEngine {
         try {
             boolean prepared;
             synchronized (handler) {
-                prepared = handler.prepare();
+                svc.mInferenceMeter.begin();
+                try {
+                    prepared = handler.prepare();
+                } finally {
+                    svc.mInferenceMeter.end();
+                }
             }
             long elapsedMillis = SystemClock.uptimeMillis() - prepareStartUptimeMillis;
 
