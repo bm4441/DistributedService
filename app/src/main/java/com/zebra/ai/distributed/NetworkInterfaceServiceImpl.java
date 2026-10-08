@@ -1,6 +1,5 @@
 package com.zebra.ai.distributed;
 
-import android.util.Log;
 
 import java.util.List;
 
@@ -22,76 +21,79 @@ final class NetworkInterfaceServiceImpl extends INetworkInterfaceService.Stub {
 
     @Override
     public void startPeerDiscovery(String capability, IPeerDiscoveryListener listener) {
-        Log.d(TAG, "startPeerDiscovery(capability=" + capability + ")");
+        EventLog.d(TAG, "startPeerDiscovery(capability=" + capability + ")");
         mService.requestPeerDiscovery(capability, listener);
     }
 
     @Override
     public void stopPeerDiscovery(String capability) {
-        Log.d(TAG, "stopPeerDiscovery(capability=" + capability + ")");
+        EventLog.d(TAG, "stopPeerDiscovery(capability=" + capability + ")");
         mService.stopPeerDiscovery(capability);
     }
 
     @Override
     public int getPeerCount() {
         int count = mService.getKnownPeers().size();
-        Log.d(TAG, "getPeerCount() -> " + count);
+        EventLog.d(TAG, "getPeerCount() -> " + count);
         return count;
     }
 
     @Override
     public List<PeerInfo> getConnectedPeers() {
         List<PeerInfo> peers = mService.getKnownPeers();
-        Log.d(TAG, "getConnectedPeers() -> " + peers.size() + " peer(s)");
+        EventLog.d(TAG, "getConnectedPeers() -> " + peers.size() + " peer(s)");
         return peers;
     }
 
     @Override
     public void getReadyPeers(List<PeerInfo> peers, String capability) {
-        Log.d(TAG, "getReadyPeers(capability=" + capability + ", " + peers.size() + " peer(s))");
+        EventLog.d(TAG, "getReadyPeers(capability=" + capability + ", " + peers.size() + " peer(s))");
         mService.getReadyPeers(peers, capability);
     }
 
     @Override
     public void registerDiscoveryListener(IPeerDiscoveryListener listener) {
-        Log.d(TAG, "registerDiscoveryListener()");
+        EventLog.d(TAG, "registerDiscoveryListener()");
         mService.registerDiscoveryListener(listener);
     }
 
     @Override
     public void unregisterDiscoveryListener(IPeerDiscoveryListener listener) {
-        Log.d(TAG, "unregisterDiscoveryListener()");
+        EventLog.d(TAG, "unregisterDiscoveryListener()");
         mService.unregisterDiscoveryListener(listener);
     }
 
     @Override
     public void submitDistinctTasks(List<DistinctTaskEnvelope> distinctTaskList,
                                      ITaskResponseCallback callback) {
-        Log.d(TAG, "submitDistinctTasks(" + distinctTaskList.size() + " task(s))");
+        EventLog.d(TAG, "submitDistinctTasks(" + distinctTaskList.size() + " task(s))");
         mService.submitDistinctTasks(distinctTaskList, callback);
     }
 
     @Override
     public void submitTaskToPeer(String targetPeerId, DistinctTaskEnvelope task,
                                   ITaskResponseCallback callback) {
-        Log.d(TAG, "submitTaskToPeer() not yet implemented");
+        EventLog.d(TAG, "submitTaskToPeer() not yet implemented");
     }
 
     @Override
     public void sendResponseBackToRoot(DistinctTaskEnvelope resultEnvelope) {
-        Log.d(TAG, "sendResponseBackToRoot() not yet implemented");
+        EventLog.d(TAG, "sendResponseBackToRoot() not yet implemented");
     }
 
     @Override
     public void cancelTaskGroup(String rootGroupId) {
-        Log.d(TAG, "cancelTaskGroup(rootGroupId=" + rootGroupId + ")");
+        EventLog.d(TAG, "cancelTaskGroup(rootGroupId=" + rootGroupId + ")");
         mService.cancelTaskGroup(rootGroupId);
     }
 
     @Override
     public String getLocalNodeId() {
         String nodeId = mService.getLocalSerialNumber();
-        Log.d(TAG, "getLocalNodeId() -> " + nodeId);
+        // Info, not Debug: the dashboard server finds this device (the sender) by matching this
+        // exact text (server.py SENDER_RE), and the default Event Level (Info) would otherwise
+        // never send it.
+        EventLog.i(TAG, "getLocalNodeId() -> " + nodeId);
         return nodeId;
     }
 }

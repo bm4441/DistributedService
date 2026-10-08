@@ -1,3 +1,27 @@
 <resources>
     <string name="app_name">Distributed Service</string>
+
+    <!-- Performance log: reading the demo application's "PerformanceMetrics" log lines (see LogAccess) -->
+    <string name="perf_log_switch">Performance log (the demo app’s PerformanceMetrics lines)</string>
+    <string name="perf_log_ask">Ask Android to allow log access</string>
+    <string name="perf_log_ask_again">Ask again in %1$d s</string>
+
+    <string name="perf_log_status_off">Performance log: OFF</string>
+    <string name="perf_log_status_no_permission">Performance log: READ_LOGS missing</string>
+    <string name="perf_log_status_not_running">Performance log: ON (starts with the service)</string>
+    <string name="perf_log_status_starting">Performance log: asking Android…</string>
+    <string name="perf_log_status_waiting">Performance log: NOT allowed yet</string>
+    <string name="perf_log_status_granted">Performance log: ALLOWED</string>
+
+    <string name="perf_log_lines_none">No line from the demo app yet.</string>
+    <string name="perf_log_lines">%1$d lines read; the last one %2$s ago.</string>
+
+    <string name="perf_log_hint_off">Turn this on only on the device that runs the demo app. Android then asks you to allow reading its log.</string>
+    <string name="perf_log_hint_no_permission">Android lets an app read other apps’ logs only if the app holds READ_LOGS, which only adb can give. Run once on a computer:\nadb shell pm grant %1$s android.permission.READ_LOGS\nthen start this app again.</string>
+    <string name="perf_log_hint_not_running">Turn ON the service. Keep this screen open while it starts: Android asks you to allow log access only while this app is on screen.</string>
+    <string name="perf_log_hint_starting">If Android asks “Allow one-time access?”, tap “Allow one-time access”.</string>
+    <string name="perf_log_hint_waiting">Android asks only while this screen is open. Press the button, then tap “Allow one-time access”. If you tapped “Don’t allow”, or the question timed out, Android keeps that answer for a minute, so the button works again in about 75 seconds.</string>
+    <string name="perf_log_hint_granted">Allowed until the service stops. After the next start Android asks again.</string>
+
+    <string name="toast_service_started_wait">DistributedService started. Keep this screen open: Android may ask you to allow log access.</string>
 </resources>

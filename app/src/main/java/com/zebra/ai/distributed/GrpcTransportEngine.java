@@ -1,7 +1,6 @@
 package com.zebra.ai.distributed;
 
 import android.net.LinkAddress;
-import android.util.Log;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -73,7 +72,7 @@ final class GrpcTransportEngine {
 
             LinkAddress linkAddress = svc.mDiscoveryEngine.getWifiLinkAddress();
             if (linkAddress == null) {
-                Log.e(TAG, "No Wi-Fi IPv4 address found; gRPC server not started.");
+                EventLog.e(TAG, "No Wi-Fi IPv4 address found; gRPC server not started.");
                 return;
             }
 
@@ -91,9 +90,9 @@ final class GrpcTransportEngine {
                         .build()
                         .start();
 
-                Log.i(TAG, "gRPC Transfer Server listening on port " + TRANSFER_PORT);
+                EventLog.i(TAG, "gRPC Transfer Server listening on port " + TRANSFER_PORT);
             } catch (IOException e) {
-                Log.e(TAG, "Failed to start gRPC server on port " + TRANSFER_PORT, e);
+                EventLog.e(TAG, "Failed to start gRPC server on port " + TRANSFER_PORT, e);
             }
         }
     }
@@ -103,9 +102,9 @@ final class GrpcTransportEngine {
             if (mGrpcServer != null) {
                 try {
                     mGrpcServer.shutdown();
-                    Log.i(TAG, "gRPC Transfer Server stopped.");
+                    EventLog.i(TAG, "gRPC Transfer Server stopped.");
                 } catch (Exception e) {
-                    Log.w(TAG, "Error shutting down gRPC server", e);
+                    EventLog.w(TAG, "Error shutting down gRPC server", e);
                 } finally {
                     mGrpcServer = null;
                 }
@@ -148,7 +147,7 @@ final class GrpcTransportEngine {
             }
         }
         long waitedMillis = (System.nanoTime() - waitStartNanos) / 1_000_000;
-        Log.d(TAG, "gRPC backpressure: waited " + waitedMillis + " ms for transport readiness");
+        EventLog.d(TAG, "gRPC backpressure: waited " + waitedMillis + " ms for transport readiness");
     }
 
     /**
@@ -167,7 +166,7 @@ final class GrpcTransportEngine {
         long giveUpAtNanos = waitStartNanos + TimeUnit.MILLISECONDS.toNanos(maxWaitMillis);
         while (!observer.isReady()) {
             if (callDone.getCount() == 0 || System.nanoTime() >= giveUpAtNanos) {
-                Log.w(TAG, "gRPC backpressure: gave up after " + (System.nanoTime() - waitStartNanos) / 1_000_000
+                EventLog.w(TAG, "gRPC backpressure: gave up after " + (System.nanoTime() - waitStartNanos) / 1_000_000
                         + " ms waiting for transport readiness"
                         + (callDone.getCount() == 0 ? " (call ended)" : " (timed out)"));
                 return false;
@@ -180,7 +179,7 @@ final class GrpcTransportEngine {
             }
         }
         long waitedMillis = (System.nanoTime() - waitStartNanos) / 1_000_000;
-        Log.d(TAG, "gRPC backpressure: waited " + waitedMillis + " ms for transport readiness");
+        EventLog.d(TAG, "gRPC backpressure: waited " + waitedMillis + " ms for transport readiness");
         return true;
     }
 
@@ -236,7 +235,7 @@ final class GrpcTransportEngine {
                         buffer.reset();
                         receivedChunkCount = 0;
                         streamStartNanos = System.nanoTime();
-                        Log.i(TAG, "gRPC receiving task envelope [" + (meta.getFileIndex() + 1) + "/"
+                        EventLog.i(TAG, "gRPC receiving task envelope [" + (meta.getFileIndex() + 1) + "/"
                                 + meta.getTotalFiles() + "] taskId=" + currentTaskId + " from " + currentSender
                                 + " (" + meta.getFileSize() + " bytes)");
 
@@ -244,8 +243,12 @@ final class GrpcTransportEngine {
                         byte[] chunkBytes = value.getChunk().toByteArray();
                         buffer.write(chunkBytes, 0, chunkBytes.length);
                         receivedChunkCount++;
-                        Log.d(TAG, "gRPC received chunk #" + receivedChunkCount + " (" + chunkBytes.length
-                                + " bytes) for taskId=" + currentTaskId);
+                        // The busiest log line (one per 64 KB chunk): with Log Print off and the
+                        // Event Level above Debug, skip even building the message.
+                        if (EventLog.isDebugEnabled()) {
+                            EventLog.d(TAG, "gRPC received chunk #" + receivedChunkCount + " ("
+                                    + chunkBytes.length + " bytes) for taskId=" + currentTaskId);
+                        }
                     }
                 }
 
@@ -254,10 +257,10 @@ final class GrpcTransportEngine {
                     // CANCELLED is the sender giving up on this upload -- e.g. its transfer thread
                     // being stopped during cleanup -- so it's expected and needs no stack trace.
                     if (Status.fromThrowable(t).getCode() == Status.Code.CANCELLED) {
-                        Log.w(TAG, "gRPC stream for taskId=" + currentTaskId + " from " + currentSender
+                        EventLog.w(TAG, "gRPC stream for taskId=" + currentTaskId + " from " + currentSender
                                 + " was cancelled by the sender");
                     } else {
-                        Log.e(TAG, "gRPC task envelope stream error (taskId=" + currentTaskId + ")", t);
+                        EventLog.e(TAG, "gRPC task envelope stream error (taskId=" + currentTaskId + ")", t);
                     }
                 }
 
@@ -298,7 +301,7 @@ final class GrpcTransportEngine {
                     // reply's trip back -- compare with the sender's "transfer time"/"throughput".
                     if (streamStartNanos != 0) {
                         long receiveMillis = (System.nanoTime() - streamStartNanos) / 1_000_000;
-                        Log.i(TAG, "gRPC received taskId=" + currentTaskId + " from " + currentSender
+                        EventLog.i(TAG, "gRPC received taskId=" + currentTaskId + " from " + currentSender
                                 + ": payload=" + formatSize(buffer.size()) + " in " + receiveMillis
                                 + "ms, throughput=" + formatThroughput(buffer.size(), receiveMillis));
                     }
@@ -309,11 +312,11 @@ final class GrpcTransportEngine {
                         // Prints once per received envelope, per the current "just confirm the
                         // transfer works" scope. Real per-task handling happens in
                         // onDataReceived() once that's implemented.
-                        Log.i(TAG, "gRPC task data received from " + currentSender
+                        EventLog.i(TAG, "gRPC task data received from " + currentSender
                                 + " (taskId=" + envelope.taskId + ")");
                         svc.mTaskEngine.onDataReceived(envelope);
                     } else {
-                        Log.e(TAG, "Failed to reconstruct DistinctTaskEnvelope from received bytes "
+                        EventLog.e(TAG, "Failed to reconstruct DistinctTaskEnvelope from received bytes "
                                 + "(taskId=" + currentTaskId + ")");
                     }
                     responseObserver.onNext(TransferResponse.newBuilder()

@@ -3,11 +3,14 @@ package com.zebra.ai.distributed;
 import android.content.Context;
 import android.net.Network;
 import android.os.SystemClock;
-import android.util.Log;
 
+import com.zebra.ai.vision.detector.BarcodeDecoder;
 import com.zebra.ai.vision.detector.DistributedModuleRecognizer;
 import com.zebra.ai.vision.detector.DistributedTextOCR;
+import com.zebra.ai.vision.detector.EntityType;
+import com.zebra.ai.vision.detector.InferencerOptions;
 import com.zebra.ai.vision.detector.ModuleRecognizer;
+import com.zebra.ai.vision.detector.TextOCR;
 import com.zebra.ai.vision.internal.distributed.LenderHandler;
 
 import java.io.File;
@@ -41,6 +44,8 @@ final class PeerReadinessEngine {
     // How long stopPeerDiscovery() waits for the per-peer transfer threads to finish after
     // stopping them, before sending release notices. They normally stop within milliseconds.
     private static final long PEER_WORKER_STOP_WAIT_MILLIS = 2000L;
+    private static final String BARCODE_DECODER_MODEL_NAME = "barcode-decoder";
+    private static final String OCR_MODEL_NAME = "text-ocr-recognizer";
 
     // Peers that have sent this device a ready-ack for a capability (i.e. peers this device has
     // reserved as their sender) -- see onPeerReadyAckReceive()/stopPeerDiscovery().
@@ -77,11 +82,42 @@ final class PeerReadinessEngine {
 
                 return DistributedModuleRecognizer.createLenderHandler(settings);
             }  catch (Exception e) {
-                Log.e(TAG, "Failed to create LenderHandler factory for product.frame", e);
+                EventLog.e(TAG, "Failed to create LenderHandler factory for product.frame", e);
                 throw e;
             }
         };
         factories.put("product.frame", productFrameFactory);
+
+        LenderHandlerFactory subtaskLenderFactory = (context) -> {
+            try {
+                // Settings creation is identical to the full product frame handler
+                File indexFile = copyAssetToFiles(context, "product.index");
+                File labelFile = copyAssetToFiles(context, "product.txt");
+
+                ModuleRecognizer.Settings settings = new ModuleRecognizer.Settings("product-and-shelf-recognizer");
+                settings.enableProductRecognitionWithIndex(
+                        "product-and-shelf-recognizer",
+                        indexFile.getAbsolutePath(),
+                        labelFile.getAbsolutePath());
+                Integer[] rpo = { InferencerOptions.DSP, InferencerOptions.CPU, InferencerOptions.GPU };
+                BarcodeDecoder.Settings barcodeDecoderSettings =
+                        new BarcodeDecoder.Settings(BARCODE_DECODER_MODEL_NAME);
+                barcodeDecoderSettings.detectorSetting.inferencerOptions.defaultDims.width = 640;
+                barcodeDecoderSettings.detectorSetting.inferencerOptions.defaultDims.height = 640;
+                barcodeDecoderSettings.detectorSetting.inferencerOptions.runtimeProcessorOrder = rpo;
+                barcodeDecoderSettings.enableAIBarcodeDecode = true;
+                Map<EntityType, BarcodeDecoder.Settings> barcodeSettings = new HashMap<>();
+                barcodeSettings.put(EntityType.LABEL, barcodeDecoderSettings);
+                settings.enableBarcodeRecognition(barcodeSettings);
+                settings.enableTextOCR(new TextOCR.Settings(OCR_MODEL_NAME));
+
+                return DistributedModuleRecognizer.createSubtaskLenderHandler(settings);
+            } catch (Exception e) {
+                EventLog.e(TAG, "Failed to create LenderHandler factory for product.embed_lookup", e);
+                throw e;
+            }
+        };
+        factories.put("product.embed_lookup", subtaskLenderFactory);
 
         LENDER_HANDLER_FACTORIES = Map.copyOf(factories);
     }
@@ -148,7 +184,7 @@ final class PeerReadinessEngine {
                 if (peer != null) {
                     svc.mTransferExecutor.execute(() -> sendReleaseNotice(peer, capability));
                 } else {
-                    Log.w(TAG, "Cannot send release notice to " + peerId + ": no longer in mKnownDevices");
+                    EventLog.w(TAG, "Cannot send release notice to " + peerId + ": no longer in mKnownDevices");
                 }
             }
         }
@@ -172,19 +208,19 @@ final class PeerReadinessEngine {
             synchronized (handler) {
                 try {
                     handler.dispose();
-                    Log.i(TAG, "Disposed LenderHandler for capability '" + capability + "'");
+                    EventLog.i(TAG, "Disposed LenderHandler for capability '" + capability + "'");
                 } catch (Exception e) {
-                    Log.w(TAG, "Error disposing LenderHandler for capability '" + capability + "'", e);
+                    EventLog.w(TAG, "Error disposing LenderHandler for capability '" + capability + "'", e);
                 }
             }
         }
 
         Network network = svc.mWifiNetwork;
         if (network == null) {
-            Log.w(TAG, "Cannot resume discoverability for capability '" + capability + "': Wi-Fi is not connected");
+            EventLog.w(TAG, "Cannot resume discoverability for capability '" + capability + "': Wi-Fi is not connected");
             return;
         }
-        Log.i(TAG, "Resuming discoverability for capability '" + capability + "'");
+        EventLog.i(TAG, "Resuming discoverability for capability '" + capability + "'");
         svc.mDiscoveryEngine.startMulticastListener(network);
     }
 
@@ -201,7 +237,7 @@ final class PeerReadinessEngine {
     void getReadyPeers(java.util.List<PeerInfo> peers, String capability) {
         for (PeerInfo peer : peers) {
             if (peer.peerId == null) {
-                Log.w(TAG, "Skipping a peer with no peerId in getReadyPeers(capability=" + capability + ")");
+                EventLog.w(TAG, "Skipping a peer with no peerId in getReadyPeers(capability=" + capability + ")");
                 continue;
             }
             svc.mTaskEngine.ensurePeerWorker(peer.peerId);
@@ -232,7 +268,7 @@ final class PeerReadinessEngine {
 
                 @Override
                 public void onError(Throwable t) {
-                    Log.e(TAG, "gRPC ready-check stream failed to " + peer.peerId, t);
+                    EventLog.e(TAG, "gRPC ready-check stream failed to " + peer.peerId, t);
                     latch.countDown();
                 }
 
@@ -267,12 +303,12 @@ final class PeerReadinessEngine {
             boolean finalSuccess = completedInTime && success[0];
 
             if (finalSuccess) {
-                Log.i(TAG, "Ready check for capability '" + capability + "' delivered to " + peer.peerId);
+                EventLog.i(TAG, "Ready check for capability '" + capability + "' delivered to " + peer.peerId);
             } else {
-                Log.e(TAG, "Ready check for capability '" + capability + "' to " + peer.peerId + " failed or timed out");
+                EventLog.e(TAG, "Ready check for capability '" + capability + "' to " + peer.peerId + " failed or timed out");
             }
         } catch (Exception e) {
-            Log.e(TAG, "Exception sending ready check to " + peer.peerId, e);
+            EventLog.e(TAG, "Exception sending ready check to " + peer.peerId, e);
         }
     }
 
@@ -284,7 +320,7 @@ final class PeerReadinessEngine {
      */
     private void sendReadyAck(String targetPeerId, String targetHostAddress, String capability) {
         if (targetHostAddress == null || targetHostAddress.isEmpty()) {
-            Log.e(TAG, "Cannot send ready ack to " + targetPeerId + ": no host address in the ready check");
+            EventLog.e(TAG, "Cannot send ready ack to " + targetPeerId + ": no host address in the ready check");
             return;
         }
         // Start the receiver's processing and result-transfer threads now, before telling the
@@ -308,7 +344,7 @@ final class PeerReadinessEngine {
 
                 @Override
                 public void onError(Throwable t) {
-                    Log.e(TAG, "gRPC ready-ack stream failed to " + targetPeerId, t);
+                    EventLog.e(TAG, "gRPC ready-ack stream failed to " + targetPeerId, t);
                     latch.countDown();
                 }
 
@@ -343,12 +379,12 @@ final class PeerReadinessEngine {
             boolean finalSuccess = completedInTime && success[0];
 
             if (finalSuccess) {
-                Log.i(TAG, "Ready ack for capability '" + capability + "' delivered to " + targetPeerId);
+                EventLog.i(TAG, "Ready ack for capability '" + capability + "' delivered to " + targetPeerId);
             } else {
-                Log.e(TAG, "Ready ack for capability '" + capability + "' to " + targetPeerId + " failed or timed out");
+                EventLog.e(TAG, "Ready ack for capability '" + capability + "' to " + targetPeerId + " failed or timed out");
             }
         } catch (Exception e) {
-            Log.e(TAG, "Exception sending ready ack to " + targetPeerId, e);
+            EventLog.e(TAG, "Exception sending ready ack to " + targetPeerId, e);
         }
     }
 
@@ -376,7 +412,7 @@ final class PeerReadinessEngine {
 
                 @Override
                 public void onError(Throwable t) {
-                    Log.e(TAG, "gRPC release-notice stream failed to " + peer.peerId, t);
+                    EventLog.e(TAG, "gRPC release-notice stream failed to " + peer.peerId, t);
                     latch.countDown();
                 }
 
@@ -411,12 +447,12 @@ final class PeerReadinessEngine {
             boolean finalSuccess = completedInTime && success[0];
 
             if (finalSuccess) {
-                Log.i(TAG, "Release notice for capability '" + capability + "' delivered to " + peer.peerId);
+                EventLog.i(TAG, "Release notice for capability '" + capability + "' delivered to " + peer.peerId);
             } else {
-                Log.e(TAG, "Release notice for capability '" + capability + "' to " + peer.peerId + " failed or timed out");
+                EventLog.e(TAG, "Release notice for capability '" + capability + "' to " + peer.peerId + " failed or timed out");
             }
         } catch (Exception e) {
-            Log.e(TAG, "Exception sending release notice to " + peer.peerId, e);
+            EventLog.e(TAG, "Exception sending release notice to " + peer.peerId, e);
         }
     }
 
@@ -461,7 +497,7 @@ final class PeerReadinessEngine {
      */
     void handleReleaseReceived(byte[] data) {
         String capability = new String(data, StandardCharsets.UTF_8);
-        Log.i(TAG, "Release notice received for capability '" + capability + "'");
+        EventLog.i(TAG, "Release notice received for capability '" + capability + "'");
         // The sender that reserved this device is done with it: stop the result-transfer thread
         // (dropping results it no longer wants) before becoming discoverable to other senders
         // again. The next ready ack starts a fresh one (TaskTransferEngine.startReceiverThreads()).
@@ -471,7 +507,7 @@ final class PeerReadinessEngine {
 
     /** Called once a peer's readiness ACK (see sendReadyAck()) arrives for a capability. */
     private void onPeerReadyAckReceive(String peerId, String capability) {
-        Log.i(TAG, "Peer " + peerId + " is ready for capability '" + capability + "'");
+        EventLog.i(TAG, "Peer " + peerId + " is ready for capability '" + capability + "'");
         svc.mKnownDevices.computeIfPresent(peerId, (id, info) -> info.withReadiness(true));
         mReadyPeersByCapability.computeIfAbsent(capability, c -> ConcurrentHashMap.newKeySet()).add(peerId);
         for (IPeerDiscoveryListener listener : svc.mDiscoveryEngine.mRegisteredListeners) {
@@ -485,7 +521,7 @@ final class PeerReadinessEngine {
      * immediately -- see prepareLenderHandler() for why.
      */
     private void onReadyCommandReceive(String senderPeerId, String capability, String senderHostAddress) {
-        Log.i(TAG, "onReadyCommandReceive: senderPeerId=" + senderPeerId + ", capability=" + capability);
+        EventLog.i(TAG, "onReadyCommandReceive: senderPeerId=" + senderPeerId + ", capability=" + capability);
         svc.mTransferExecutor.execute(() -> prepareLenderHandler(senderPeerId, capability, senderHostAddress));
     }
 
@@ -502,7 +538,7 @@ final class PeerReadinessEngine {
     private void prepareLenderHandler(String senderPeerId, String capability, String senderHostAddress) {
         LenderHandler handler = getOrCreateLenderHandler(capability);
         if (handler == null) {
-            Log.e(TAG, "No LenderHandler available for capability '" + capability
+            EventLog.e(TAG, "No LenderHandler available for capability '" + capability
                     + "' (ready check from " + senderPeerId + ")");
             return;
         }
@@ -515,23 +551,23 @@ final class PeerReadinessEngine {
             long elapsedMillis = SystemClock.uptimeMillis() - prepareStartUptimeMillis;
 
             if (!prepared) {
-                Log.e(TAG, "LenderHandler for capability '" + capability + "' reported prepare() failure"
+                EventLog.e(TAG, "LenderHandler for capability '" + capability + "' reported prepare() failure"
                         + " after " + elapsedMillis + " ms (ready check from " + senderPeerId + ")");
                 return;
             }
-            Log.i(TAG, "LenderHandler for capability '" + capability + "' is now warm/ready after "
+            EventLog.i(TAG, "LenderHandler for capability '" + capability + "' is now warm/ready after "
                     + elapsedMillis + " ms (ready check from " + senderPeerId + ")");
 
             // This device is now committed to senderPeerId's task -- stop advertising
             // ourselves to discovery requests from any other sender before telling this one
             // we're ready, so no other sender can discover and claim an already-spoken-for peer.
-            Log.i(TAG, "Stopping multicast listener; this device is now reserved for " + senderPeerId);
+            EventLog.i(TAG, "Stopping multicast listener; this device is now reserved for " + senderPeerId);
             svc.mDiscoveryEngine.stopMulticastListener();
 
             sendReadyAck(senderPeerId, senderHostAddress, capability);
         } catch (Exception e) {
             long elapsedMillis = SystemClock.uptimeMillis() - prepareStartUptimeMillis;
-            Log.e(TAG, "Failed to prepare LenderHandler for capability '" + capability
+            EventLog.e(TAG, "Failed to prepare LenderHandler for capability '" + capability
                     + "' after " + elapsedMillis + " ms", e);
         }
     }
@@ -553,13 +589,13 @@ final class PeerReadinessEngine {
     private LenderHandler createLenderHandlerFor(String capability) {
         LenderHandlerFactory factory = LENDER_HANDLER_FACTORIES.get(capability);
         if (factory == null) {
-            Log.e(TAG, "No LenderHandler factory registered for capability '" + capability + "'");
+            EventLog.e(TAG, "No LenderHandler factory registered for capability '" + capability + "'");
             return null;
         }
         try {
             return factory.create(this.svc);
         } catch (Exception e) {
-            Log.e(TAG, "Failed to build LenderHandler for capability '" + capability + "'", e);
+            EventLog.e(TAG, "Failed to build LenderHandler for capability '" + capability + "'", e);
             return null;
         }
     }

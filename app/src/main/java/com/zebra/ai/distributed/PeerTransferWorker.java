@@ -1,6 +1,5 @@
 package com.zebra.ai.distributed;
 
-import android.util.Log;
 
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
@@ -39,7 +38,7 @@ final class PeerTransferWorker {
                 new LoggingThreadFactory("PeerTransfer-" + peerId));
         // Start the thread now, when the peer is asked to get ready, rather than on its first task.
         mExecutor.prestartCoreThread();
-        Log.i(TAG, "Started transfer thread PeerTransfer-" + peerId + " (queue size "
+        EventLog.i(TAG, "Started transfer thread PeerTransfer-" + peerId + " (queue size "
                 + MAX_QUEUED_TASKS + ")");
     }
 
@@ -73,7 +72,7 @@ final class PeerTransferWorker {
     void shutdown() {
         boolean uploading = mExecutor.getActiveCount() > 0;
         int dropped = mExecutor.shutdownNow().size();
-        Log.i(TAG, "Stopping transfer thread PeerTransfer-" + mPeerId + ": " + dropped
+        EventLog.i(TAG, "Stopping transfer thread PeerTransfer-" + mPeerId + ": " + dropped
                 + " queued task(s) dropped, " + (uploading ? "interrupting the upload in progress"
                 : "no upload in progress"));
     }

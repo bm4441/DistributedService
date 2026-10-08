@@ -1,7 +1,6 @@
 package com.zebra.ai.distributed;
 
 import android.os.Process;
-import android.util.Log;
 
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -31,22 +30,22 @@ final class LoggingThreadFactory implements ThreadFactory {
         int count = mCreatedCount.incrementAndGet();
         String threadName = count == 1 ? mName : mName + "#" + count;
         if (count == 1) {
-            Log.i(TAG, "Creating thread " + threadName);
+            EventLog.i(TAG, "Creating thread " + threadName);
         } else {
-            Log.w(TAG, "Creating thread " + threadName + " to replace one that exited unexpectedly");
+            EventLog.w(TAG, "Creating thread " + threadName + " to replace one that exited unexpectedly");
         }
         return new Thread(() -> {
-            Log.i(TAG, "Thread " + threadName + " running (tid=" + Process.myTid() + ")");
+            EventLog.i(TAG, "Thread " + threadName + " running (tid=" + Process.myTid() + ")");
             boolean returnedNormally = false;
             try {
                 runnable.run();
                 returnedNormally = true;
             } finally {
                 if (returnedNormally) {
-                    Log.i(TAG, "Thread " + threadName + " (tid=" + Process.myTid() + ") exited");
+                    EventLog.i(TAG, "Thread " + threadName + " (tid=" + Process.myTid() + ") exited");
                 } else {
                     // The exception itself is logged by DistributedService's crash logger.
-                    Log.e(TAG, "Thread " + threadName + " (tid=" + Process.myTid()
+                    EventLog.e(TAG, "Thread " + threadName + " (tid=" + Process.myTid()
                             + ") is exiting on an uncaught exception");
                 }
             }

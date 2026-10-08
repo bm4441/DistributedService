@@ -3,7 +3,6 @@ package com.zebra.ai.distributed;
 import android.os.Parcel;
 import android.os.SharedMemory;
 import android.os.SystemClock;
-import android.util.Log;
 
 import com.google.protobuf.ByteString;
 import com.zebra.ai.vision.internal.distributed.LenderHandler;
@@ -76,10 +75,10 @@ final class TaskTransferEngine {
     private PeerTransferWorker startOrReusePeerWorker(String peerId) {
         return mPeerWorkers.compute(peerId, (id, existing) -> {
             if (existing != null && existing.isRunning()) {
-                Log.d(TAG, "Transfer thread PeerTransfer-" + id + " already running; reusing it");
+                EventLog.d(TAG, "Transfer thread PeerTransfer-" + id + " already running; reusing it");
                 return existing;
             }
-            Log.i(TAG, (existing != null ? "Transfer thread PeerTransfer-" + id + " was stopped"
+            EventLog.i(TAG, (existing != null ? "Transfer thread PeerTransfer-" + id + " was stopped"
                     : "No transfer thread for peer " + id + " yet") + "; starting one");
             return new PeerTransferWorker(id);
         });
@@ -101,7 +100,7 @@ final class TaskTransferEngine {
                 stopped.add(entry.getValue());
             }
         }
-        Log.i(TAG, "Stopped " + stopped.size() + " peer transfer thread(s)" + (waitMillis > 0
+        EventLog.i(TAG, "Stopped " + stopped.size() + " peer transfer thread(s)" + (waitMillis > 0
                 ? "; waiting up to " + waitMillis + " ms for them to finish" : "; not waiting for them"));
         if (waitMillis <= 0) {
             return;
@@ -111,10 +110,10 @@ final class TaskTransferEngine {
         long giveUpAtMillis = stopStartMillis + waitMillis;
         for (PeerTransferWorker worker : stopped) {
             if (worker.awaitStopped(Math.max(0L, giveUpAtMillis - SystemClock.uptimeMillis()))) {
-                Log.i(TAG, "Transfer thread PeerTransfer-" + worker.getPeerId() + " finished "
+                EventLog.i(TAG, "Transfer thread PeerTransfer-" + worker.getPeerId() + " finished "
                         + (SystemClock.uptimeMillis() - stopStartMillis) + " ms after being stopped");
             } else {
-                Log.w(TAG, "Transfer thread PeerTransfer-" + worker.getPeerId() + " didn't finish within "
+                EventLog.w(TAG, "Transfer thread PeerTransfer-" + worker.getPeerId() + " didn't finish within "
                         + waitMillis + " ms of being stopped");
             }
         }
@@ -134,7 +133,7 @@ final class TaskTransferEngine {
         if (mProcessingExecutor.getPoolSize() == 0) {
             mProcessingExecutor.prestartCoreThread();
         } else {
-            Log.d(TAG, "Task processing thread already running; reusing it");
+            EventLog.d(TAG, "Task processing thread already running; reusing it");
         }
         svc.mResultEngine.startResultTransferThread();
     }
@@ -143,7 +142,7 @@ final class TaskTransferEngine {
     void shutdownProcessingThread() {
         boolean processing = mProcessingExecutor.getActiveCount() > 0;
         int dropped = mProcessingExecutor.shutdownNow().size();
-        Log.i(TAG, "Stopping task processing thread: " + dropped + " queued task(s) dropped"
+        EventLog.i(TAG, "Stopping task processing thread: " + dropped + " queued task(s) dropped"
                 + (processing ? ", one still being processed" : ""));
     }
 
@@ -171,7 +170,7 @@ final class TaskTransferEngine {
         }
         for (DistinctTaskEnvelope task : distinctTaskList) {
             if (task.targetPeerId == null) {
-                Log.e(TAG, "Cannot submit task " + task.taskId + ": it has no targetPeerId.");
+                EventLog.e(TAG, "Cannot submit task " + task.taskId + ": it has no targetPeerId.");
                 svc.mResultEngine.reportPeerTaskFailed(task.rootGroupId, task.taskId, null,
                         ResultTransferEngine.ERROR_PEER_UNKNOWN, "Task has no target peer.");
                 continue;
@@ -181,7 +180,7 @@ final class TaskTransferEngine {
             if (worker == null || !worker.isRunning()) {
                 // getReadyPeers() normally started it already; if not, start it now so every
                 // transfer to this peer still goes through the peer's one thread.
-                Log.w(TAG, "Task " + task.taskId + ": no running transfer thread for "
+                EventLog.w(TAG, "Task " + task.taskId + ": no running transfer thread for "
                         + task.targetPeerId + " (not started by getReadyPeers(), or stopped since)");
                 worker = startOrReusePeerWorker(task.targetPeerId);
             }
@@ -194,7 +193,7 @@ final class TaskTransferEngine {
             long queuedAtMillis = SystemClock.uptimeMillis();
 
             boolean accepted = worker.submit(() -> {
-                Log.i(TAG, "Uploading task " + task.taskId + " to " + task.targetPeerId + " after "
+                EventLog.i(TAG, "Uploading task " + task.taskId + " to " + task.targetPeerId + " after "
                         + (SystemClock.uptimeMillis() - queuedAtMillis) + " ms queued");
                 try {
                     sendDistinctTask(task);
@@ -202,7 +201,7 @@ final class TaskTransferEngine {
                     // sendDistinctTask() catches what it expects to fail; this only keeps an
                     // unforeseen RuntimeException from killing the peer's thread -- and, uncaught
                     // on any thread, the whole process.
-                    Log.e(TAG, "Unexpected error sending task " + task.taskId + " to " + task.targetPeerId, e);
+                    EventLog.e(TAG, "Unexpected error sending task " + task.taskId + " to " + task.targetPeerId, e);
                     svc.mResultEngine.reportPeerTaskFailed(task.rootGroupId, task.taskId, task.targetPeerId,
                             ResultTransferEngine.ERROR_TRANSFER_EXCEPTION, String.valueOf(e.getMessage()));
                 }
@@ -215,7 +214,7 @@ final class TaskTransferEngine {
                         : ResultTransferEngine.ERROR_TRANSFER_FAILED;
                 String reason = queueFull ? "Transfer queue for the peer is full"
                         : "Transfer thread for the peer is stopped";
-                Log.w(TAG, "Cannot submit task " + task.taskId + " to " + task.targetPeerId + ": " + reason);
+                EventLog.w(TAG, "Cannot submit task " + task.taskId + " to " + task.targetPeerId + ": " + reason);
                 // Nothing will upload it now: free its payload's shared memory right away rather
                 // than whenever the garbage collector gets to it.
                 if (task.payloadSharedMemory != null) {
@@ -231,7 +230,7 @@ final class TaskTransferEngine {
         // Mirrors onDataReceived()'s log line exactly, field for field, so the sender's outgoing
         // log and the receiver's incoming log can be diffed directly to confirm the same data
         // actually made it across.
-        Log.i(TAG, "sendDistinctTask: rootGroupId=" + task.rootGroupId
+        EventLog.i(TAG, "sendDistinctTask: rootGroupId=" + task.rootGroupId
                 + ", taskId=" + task.taskId
                 + ", originatorNodeId=" + task.originatorNodeId
                 + ", targetPeerId=" + task.targetPeerId
@@ -247,7 +246,7 @@ final class TaskTransferEngine {
         assert task.targetPeerId != null;
         PeerInfo targetPeer = svc.mKnownDevices.get(task.targetPeerId);
         if (targetPeer == null) {
-            Log.e(TAG, "Cannot submit task " + task.taskId + ": target peer " + task.targetPeerId + " is unknown.");
+            EventLog.e(TAG, "Cannot submit task " + task.taskId + ": target peer " + task.targetPeerId + " is unknown.");
             svc.mResultEngine.reportPeerTaskFailed(task.rootGroupId, task.taskId, task.targetPeerId,
                     ResultTransferEngine.ERROR_PEER_UNKNOWN, "Target peer " + task.targetPeerId + " is unknown.");
             return;
@@ -281,10 +280,10 @@ final class TaskTransferEngine {
                 public void onError(Throwable t) {
                     if (cancelledHere.get()) {
                         // Only our own cancel() below coming back -- its outcome is logged there.
-                        Log.d(TAG, "gRPC task submission stream to " + task.targetPeerId
+                        EventLog.d(TAG, "gRPC task submission stream to " + task.targetPeerId
                                 + " closed after this device cancelled it");
                     } else {
-                        Log.e(TAG, "gRPC task submission stream failed to " + task.targetPeerId, t);
+                        EventLog.e(TAG, "gRPC task submission stream failed to " + task.targetPeerId, t);
                     }
                     latch.countDown();
                 }
@@ -351,22 +350,22 @@ final class TaskTransferEngine {
             long transferMillis = SystemClock.uptimeMillis() - transferStartMillis;
 
             if (success) {
-                Log.i(TAG, "Task " + task.taskId + " (" + payload.length + " bytes) delivered to " + task.targetPeerId);
+                EventLog.i(TAG, "Task " + task.taskId + " (" + payload.length + " bytes) delivered to " + task.targetPeerId);
                 svc.mResultEngine.recordTransferTime(task.taskId, false, payload.length, transferMillis);
             } else if (interrupted) {
-                Log.w(TAG, "Task " + task.taskId + " upload to " + task.targetPeerId + " stopped after "
+                EventLog.w(TAG, "Task " + task.taskId + " upload to " + task.targetPeerId + " stopped after "
                         + transferMillis + " ms: its transfer thread is shutting down");
                 svc.mResultEngine.reportPeerTaskFailed(task.rootGroupId, task.taskId, task.targetPeerId,
                         ResultTransferEngine.ERROR_TRANSFER_FAILED,
                         "Upload stopped: transfer thread shutting down");
             } else {
-                Log.e(TAG, "Task " + task.taskId + " delivery to " + task.targetPeerId + " failed or timed out");
+                EventLog.e(TAG, "Task " + task.taskId + " delivery to " + task.targetPeerId + " failed or timed out");
                 svc.mResultEngine.reportPeerTaskFailed(task.rootGroupId, task.taskId, task.targetPeerId,
                         ResultTransferEngine.ERROR_TRANSFER_FAILED, "Task delivery failed or timed out");
             }
 
         } catch (Exception e) {
-            Log.e(TAG, "Exception submitting task " + task.taskId + " to " + task.targetPeerId, e);
+            EventLog.e(TAG, "Exception submitting task " + task.taskId + " to " + task.targetPeerId, e);
             svc.mResultEngine.reportPeerTaskFailed(task.rootGroupId, task.taskId, task.targetPeerId,
                     ResultTransferEngine.ERROR_TRANSFER_EXCEPTION, String.valueOf(e.getMessage()));
         }
@@ -379,7 +378,7 @@ final class TaskTransferEngine {
      * transfer itself works.
      */
     void onDataReceived(DistinctTaskEnvelope envelope) {
-        Log.i(TAG, "onDataReceived: rootGroupId=" + envelope.rootGroupId //ocr_recognise
+        EventLog.i(TAG, "onDataReceived: rootGroupId=" + envelope.rootGroupId //ocr_recognise
                 + ", taskId=" + envelope.taskId
                 + ", originatorNodeId=" + envelope.originatorNodeId
                 + ", targetPeerId=" + envelope.targetPeerId
@@ -410,7 +409,7 @@ final class TaskTransferEngine {
                 mProcessingExecutor.execute(() -> processDistinctTask(envelope));
             } catch (RejectedExecutionException e) {
                 // Only after shutdownProcessingThread() (onDestroy) -- nothing will process it now.
-                Log.w(TAG, "Dropping taskId=" + envelope.taskId + ": the processing thread is stopped");
+                EventLog.w(TAG, "Dropping taskId=" + envelope.taskId + ": the processing thread is stopped");
             }
         }
     }
@@ -435,7 +434,7 @@ final class TaskTransferEngine {
         try {
             LenderHandler handler = svc.mReadinessEngine.mLenderHandlers.get(envelope.capability);
             if (handler == null) {
-                Log.e(TAG, "No LenderHandler available for capability '" + envelope.capability
+                EventLog.e(TAG, "No LenderHandler available for capability '" + envelope.capability
                         + "', taskId=" + envelope.taskId);
                 return;
             }
@@ -444,7 +443,7 @@ final class TaskTransferEngine {
             if (envelope.payloadSharedMemory != null) {
                 request = SharedMemoryUtil.unwrap(envelope.payloadSharedMemory);
             } else {
-                Log.w(TAG, "No payloadSharedMemory for taskId=" + envelope.taskId
+                EventLog.w(TAG, "No payloadSharedMemory for taskId=" + envelope.taskId
                         + "; calling handle() with a null request");
                 request = null;
             }
@@ -457,7 +456,7 @@ final class TaskTransferEngine {
             // re-load its model -- so the task is dropped instead of run on a disposed handler.
             synchronized (handler) {
                 if (svc.mReadinessEngine.mLenderHandlers.get(envelope.capability) != handler) {
-                    Log.w(TAG, "LenderHandler for capability '" + envelope.capability
+                    EventLog.w(TAG, "LenderHandler for capability '" + envelope.capability
                             + "' was released; dropping taskId=" + envelope.taskId);
                     return;
                 }
@@ -468,7 +467,7 @@ final class TaskTransferEngine {
             long totalProcessingMillis = mTotalProcessingMillis.addAndGet(processingMillis);
             long avgProcessingMillis = totalProcessingMillis / processingCount;
 
-            Log.i(TAG, "Processing is done. taskId=" + envelope.taskId
+            EventLog.i(TAG, "Processing is done. taskId=" + envelope.taskId
                     + ", response=" + (response != null ? response.length + " byte(s)" : "null")
                     + ", processing time=" + processingMillis + "ms (Avg processing time="
                     + avgProcessingMillis + "ms)");
@@ -481,10 +480,10 @@ final class TaskTransferEngine {
                 DistinctTaskEnvelope resultEnvelope = envelope.asResult(null, SharedMemoryUtil.wrap(response));
                 svc.mResultEngine.queueResult(resultEnvelope);
             } else {
-                Log.w(TAG, "No response to send back for taskId=" + envelope.taskId);
+                EventLog.w(TAG, "No response to send back for taskId=" + envelope.taskId);
             }
         } catch (Exception e) {
-            Log.e(TAG, "LenderHandler processing failed for taskId=" + envelope.taskId, e);
+            EventLog.e(TAG, "LenderHandler processing failed for taskId=" + envelope.taskId, e);
         }
     }
 
@@ -576,7 +575,7 @@ final class TaskTransferEngine {
                     wireSafe.capability, wireSafe.sliceIndex, wireSafe.totalSlices, wireSafe.hopCount,
                     wireSafe.maxHops, wireSafe.metadataParams, sharedMemory);
         } catch (Exception e) {
-            Log.e(TAG, "Failed to unmarshall DistinctTaskEnvelope", e);
+            EventLog.e(TAG, "Failed to unmarshall DistinctTaskEnvelope", e);
             return null;
         }
     }

@@ -22,7 +22,6 @@ import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.IBinder;
 import android.provider.Settings;
-import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 
@@ -75,7 +74,7 @@ public class DistributedService extends Service {
             new ConnectivityManager.NetworkCallback() {
                 @Override
                 public void onAvailable(@NonNull Network network) {
-                    Log.i(TAG, "Wi-Fi connected on network " + network);
+                    EventLog.i(TAG, "Wi-Fi connected on network " + network);
                     mWifiNetwork = network;
                     mDiscoveryEngine.startMulticastListener(network);
                     mTransferExecutor.execute(mGrpcEngine::startTransferServer);
@@ -83,7 +82,7 @@ public class DistributedService extends Service {
 
                 @Override
                 public void onLost(@NonNull Network network) {
-                    Log.i(TAG, "Wi-Fi disconnected from network " + network);
+                    EventLog.i(TAG, "Wi-Fi disconnected from network " + network);
                     mWifiNetwork = null;
                     mKnownDevices.clear();
                     mDiscoveryEngine.mPendingRequests.clear();
@@ -113,6 +112,9 @@ public class DistributedService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        // First, so everything below -- and the crash logger -- already logs through it. This also
+        // starts the log-forwarder process (see EventLog.init()).
+        EventLog.init(this);
         installCrashLogger();
         createNotificationChannel();
         initializeLenderHandlers();
@@ -124,6 +126,8 @@ public class DistributedService extends Service {
      * have anyway. The system's own crash report goes to the AndroidRuntime tag, which a
      * "logcat -s DistributedService" filter hides. Native crashes (inside the SDK's .so libraries)
      * aren't Java exceptions and don't come through here -- those need "logcat -b crash".
+     * Goes through EventLog.fatal(): always written to logcat, whatever the Log Print setting,
+     * and the events still queued are handed to the forwarder before the process dies.
      */
     private static void installCrashLogger() {
         if (sCrashLoggerInstalled) {
@@ -132,7 +136,7 @@ public class DistributedService extends Service {
         sCrashLoggerInstalled = true;
         Thread.UncaughtExceptionHandler systemHandler = Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
-            Log.e(TAG, "FATAL: uncaught exception on thread " + thread.getName()
+            EventLog.fatal(TAG, "FATAL: uncaught exception on thread " + thread.getName()
                     + " -- the process is about to crash", throwable);
             if (systemHandler != null) {
                 systemHandler.uncaughtException(thread, throwable);
@@ -157,9 +161,9 @@ public class DistributedService extends Service {
     private void initializeLenderHandlers() {
         try {
             boolean initialized = AIVisionSDK.getInstance(this).init();
-            Log.i(TAG, "AIVisionSDK.init() " + (initialized ? "succeeded" : "returned false"));
+            EventLog.i(TAG, "AIVisionSDK.init() " + (initialized ? "succeeded" : "returned false"));
         } catch (Exception e) {
-            Log.e(TAG, "AIVisionSDK.init() failed", e);
+            EventLog.e(TAG, "AIVisionSDK.init() failed", e);
         }
     }
 
@@ -172,7 +176,7 @@ public class DistributedService extends Service {
         broadcastState(true);
 
         if (!mDiscoveryEngine.isListening() && mConnectivityManager == null) {
-            Log.i(TAG, GREETING + " [onStartCommand - Initializing]");
+            EventLog.i(TAG, GREETING + " [onStartCommand - Initializing]");
 
             mConnectivityManager = getSystemService(ConnectivityManager.class);
             if (mConnectivityManager != null) {
@@ -183,11 +187,11 @@ public class DistributedService extends Service {
                             .build();
                     mConnectivityManager.registerNetworkCallback(wifiRequest, mWifiNetworkCallback);
                 } catch (Exception e) {
-                    Log.e(TAG, "Failed to register network callback", e);
+                    EventLog.e(TAG, "Failed to register network callback", e);
                 }
             }
         } else {
-            Log.i(TAG, "DistributedService already active, ignoring redundant start.");
+            EventLog.i(TAG, "DistributedService already active, ignoring redundant start.");
         }
 
         return START_STICKY;
@@ -231,13 +235,16 @@ public class DistributedService extends Service {
                     try {
                         handler.dispose();
                     } catch (Exception e) {
-                        Log.w(TAG, "Error disposing LenderHandler", e);
+                        EventLog.w(TAG, "Error disposing LenderHandler", e);
                     }
                 }
             }
         }
 
-        Log.i(TAG, "DistributedService destroyed and stopped.");
+        EventLog.i(TAG, "DistributedService destroyed and stopped.");
+        // Last: delivers the final events to the forwarder, then unbinds it so it flushes to the
+        // server and stops.
+        EventLog.shutdown();
     }
 
     private void broadcastState(boolean isRunning) {
@@ -297,7 +304,7 @@ public class DistributedService extends Service {
                         // Fallback in case of emulator or unique testing environment
                         mLocalSerialNumber = "DEV_" + Build.MODEL.replaceAll("[^a-zA-Z0-9]", "_");
                     }
-                    Log.i(TAG, "Local serial number: " + mLocalSerialNumber);
+                    EventLog.i(TAG, "Local serial number: " + mLocalSerialNumber);
                 }
             }
         }
