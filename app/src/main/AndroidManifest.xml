@@ -17,6 +17,17 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Lets the log forwarder read the demo application's "PerformanceMetrics" log lines from logcat (they are
+         another app's, which a normal app is not shown). A normal app is not given this on install: grant it once
+         from a PC with
+             adb shell pm grant com.zebra.ai.distributed android.permission.READ_LOGS
+         and start the app again. Since Android 12 that is not enough: each logcat reader also has to be allowed by the
+         user ("Allow one-time access"), and Android asks only while this app is on screen : the main screen's
+         "Performance log" switch and button exist for that (see LogAccess). Without any of it nothing else is
+         affected, the performance lines just do not arrive. -->
+    <uses-permission android:name="android.permission.READ_LOGS"
+        tools:ignore="ProtectedPermissions" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -25,11 +36,15 @@
         android:label="Distributed Service"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.MaterialComponents.DayNight.DarkActionBar">
 
+        <!-- adjustResize: where the system still makes the window smaller for the keyboard (Android 14 and older) it does so
+             on purpose; from Android 15 the screen does that itself (see MainActivity.fitToSystemBars()). -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -49,6 +64,15 @@
                 <action android:name="com.srjana.server.DISTRIBUTED_SERVICE" />
             </intent-filter>
         </service>
+
+        <!-- Streams DistributedService's log events to the dashboard server, in a process of its
+             own so network I/O never touches the service's threads. Not started directly: it is
+             bound by DistributedService (see EventLog.init()) and stops when that unbinds. -->
+        <service
+            android:name=".LogForwarderService"
+            android:enabled="true"
+            android:exported="false"
+            android:process=":log_forwarder" />
 
     </application>
 

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Nothing is declared here: the app's manifest declares the LogForwarderService (the ":log_forwarder" process) and the
+     READ_LOGS permission it uses. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+</manifest>

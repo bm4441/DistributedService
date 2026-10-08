@@ -9,7 +9,6 @@ import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.PowerManager;
 import android.os.RemoteException;
-import android.util.Log;
 
 import java.io.IOException;
 import java.net.DatagramPacket;
@@ -84,11 +83,11 @@ final class MulticastDiscoveryEngine {
     void startMulticastListener(Network network) {
         synchronized (mSocketLock) {
             if (mIsListening.get() && mDiscoverySocket != null && !mDiscoverySocket.isClosed()) {
-                Log.i(TAG, "Multicast listener already active on port " + DISCOVERY_PORT + ", skipping re-bind.");
+                EventLog.i(TAG, "Multicast listener already active on port " + DISCOVERY_PORT + ", skipping re-bind.");
                 return;
             }
             stopMulticastListener();
-            Log.i(TAG, "Starting high-performance multicast listener...");
+            EventLog.i(TAG, "Starting high-performance multicast listener...");
 
             PowerManager pm = svc.getSystemService(PowerManager.class);
             if (pm != null) {
@@ -128,7 +127,7 @@ final class MulticastDiscoveryEngine {
                 mDiscoverySocket = socket;
                 mIsListening.set(true);
 
-                Log.i(TAG, "Multicast joined on group " + MULTICAST_GROUP_ADDRESS
+                EventLog.i(TAG, "Multicast joined on group " + MULTICAST_GROUP_ADDRESS
                         + " interface " + (nif != null ? nif.getName() : "default")
                         + " port " + DISCOVERY_PORT);
 
@@ -136,7 +135,7 @@ final class MulticastDiscoveryEngine {
                 listenerThread.setPriority(Thread.MAX_PRIORITY);
                 listenerThread.start();
             } catch (IOException e) {
-                Log.e(TAG, "Failed to start multicast listener", e);
+                EventLog.e(TAG, "Failed to start multicast listener", e);
                 stopMulticastListener();
             }
         }
@@ -156,7 +155,7 @@ final class MulticastDiscoveryEngine {
                 } finally {
                     socket.close();
                 }
-                Log.i(TAG, "Multicast listener socket closed.");
+                EventLog.i(TAG, "Multicast listener socket closed.");
             }
 
             if (mMulticastLock != null && mMulticastLock.isHeld()) {
@@ -179,7 +178,7 @@ final class MulticastDiscoveryEngine {
         if (socket == null) return;
 
         byte[] buffer = new byte[MAX_PACKET_BYTES];
-        Log.i(TAG, "Discovery receive loop running.");
+        EventLog.i(TAG, "Discovery receive loop running.");
 
         while (mIsListening.get() && !socket.isClosed()) {
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
@@ -187,13 +186,13 @@ final class MulticastDiscoveryEngine {
                 socket.receive(packet);
             } catch (IOException e) {
                 if (!mIsListening.get()) break;
-                Log.w(TAG, "Receive loop exception: " + e.getMessage());
+                EventLog.w(TAG, "Receive loop exception: " + e.getMessage());
                 continue;
             }
 
             handleIncomingPacket(packet);
         }
-        Log.i(TAG, "Discovery receive loop terminated.");
+        EventLog.i(TAG, "Discovery receive loop terminated.");
     }
 
     private void handleIncomingPacket(DatagramPacket packet) {
@@ -227,7 +226,7 @@ final class MulticastDiscoveryEngine {
             if (svc.getLocalSerialNumber().equals(serialNumber)) {
                 return;
             }
-            Log.i(TAG, "Received MSG from " + serialNumber + " (req=" + requestId + "): " + messageBody);
+            EventLog.i(TAG, "Received MSG from " + serialNumber + " (req=" + requestId + "): " + messageBody);
 
             InetAddress senderAddress = packet.getAddress();
             int senderPort = packet.getPort();
@@ -235,18 +234,18 @@ final class MulticastDiscoveryEngine {
 
             svc.mOutboundExecutor.execute(() -> {
                 if (currentNetwork != null) {
-                    Log.i(TAG, "Dispatching ACK to " + senderAddress + ":" + senderPort);
+                    EventLog.i(TAG, "Dispatching ACK to " + senderAddress + ":" + senderPort);
                     sendAck(requestId, senderAddress, senderPort);
                     // Check if active; if not, spin it up on this first MSG
                     if (!svc.mGrpcEngine.isTransferServerActive()) {
-                        Log.e(TAG, "Transfer server Is not started; Restarting the Transfer server");
+                        EventLog.e(TAG, "Transfer server Is not started; Restarting the Transfer server");
                         svc.mTransferExecutor.execute(svc.mGrpcEngine::startTransferServer);
                     }
                 }
             });
 
         } else if (TYPE_ACK.equals(type)) {
-            Log.i(TAG, "Received ACK from " + serialNumber + " (req=" + requestId + ")");
+            EventLog.i(TAG, "Received ACK from " + serialNumber + " (req=" + requestId + ")");
             InetAddress peerAddress = packet.getAddress();
             PeerInfo peerInfo = decodePeerInfo(serialNumber, peerAddress, messageBody);
             svc.mKnownDevices.put(serialNumber, peerInfo);
@@ -254,7 +253,10 @@ final class MulticastDiscoveryEngine {
             PendingRequest pending = mPendingRequests.get(requestId);
             if (pending != null) {
                 if (pending.respondingPeers.putIfAbsent(serialNumber, peerInfo) == null) {
-                    Log.d(TAG, "New peer responded to discovery: " + serialNumber);
+                    // Info, not Debug: the dashboard server finds peers by matching this exact text
+                    // (server.py PEER_FOUND_RE), and the default Event Level (Info) would otherwise
+                    // never send it.
+                    EventLog.i(TAG, "New peer responded to discovery: " + serialNumber);
                     safeOnPeerJoined(pending.listener, peerInfo);
                 }
             }
@@ -272,9 +274,9 @@ final class MulticastDiscoveryEngine {
             }
             DatagramPacket packet = new DatagramPacket(data, data.length, toAddress, toPort);
             ackSocket.send(packet);
-            Log.i(TAG, "Dispatched instant ACK for req=" + requestId + " to " + toAddress + ":" + toPort);
+            EventLog.i(TAG, "Dispatched instant ACK for req=" + requestId + " to " + toAddress + ":" + toPort);
         } catch (IOException e) {
-            Log.e(TAG, "Failed to send ACK to " + toAddress + ":" + toPort, e);
+            EventLog.e(TAG, "Failed to send ACK to " + toAddress + ":" + toPort, e);
         }
     }
 
@@ -287,7 +289,7 @@ final class MulticastDiscoveryEngine {
      */
     void requestPeerDiscovery(String capability, IPeerDiscoveryListener listener) {
         if (svc.mWifiNetwork == null) {
-            Log.w(TAG, "Wi-Fi is not connected. Discovery aborted.");
+            EventLog.w(TAG, "Wi-Fi is not connected. Discovery aborted.");
             safeOnDiscoveryFailed(listener, capability, ERROR_WIFI_UNAVAILABLE, "Wi-Fi is not connected");
             return;
         }
@@ -299,7 +301,7 @@ final class MulticastDiscoveryEngine {
         Network network = svc.mWifiNetwork;
 
         if (socket == null || socket.isClosed() || network == null) {
-            Log.e(TAG, "Cannot broadcast: Network or Multicast socket is unavailable.");
+            EventLog.e(TAG, "Cannot broadcast: Network or Multicast socket is unavailable.");
             safeOnDiscoveryFailed(listener, capability, ERROR_DISCOVERY_SOCKET_UNAVAILABLE,
                     "Multicast discovery socket is unavailable");
             return;
@@ -316,9 +318,9 @@ final class MulticastDiscoveryEngine {
                 InetAddress group = InetAddress.getByName(MULTICAST_GROUP_ADDRESS);
                 DatagramPacket packet = new DatagramPacket(data, data.length, group, DISCOVERY_PORT);
                 socket.send(packet);
-                Log.i(TAG, "Multicast request sent (id=" + requestId + ")");
+                EventLog.i(TAG, "Multicast request sent (id=" + requestId + ")");
             } catch (IOException e) {
-                Log.e(TAG, "Failed to send multicast request", e);
+                EventLog.e(TAG, "Failed to send multicast request", e);
                 mPendingRequests.remove(requestId);
                 safeOnDiscoveryFailed(listener, capability, ERROR_MULTICAST_SEND_FAILED,
                         "Failed to send discovery request: " + e.getMessage());
@@ -332,7 +334,7 @@ final class MulticastDiscoveryEngine {
         PendingRequest pending = mPendingRequests.remove(requestId);
         if (pending == null) return;
 
-        Log.i(TAG, "Discovery window closed for " + requestId + ". Total responding peer(s): "
+        EventLog.i(TAG, "Discovery window closed for " + requestId + ". Total responding peer(s): "
                 + pending.respondingPeers.size());
 
         List<PeerInfo> peers = new ArrayList<>(pending.respondingPeers.values());
@@ -426,7 +428,7 @@ final class MulticastDiscoveryEngine {
                     port, nodeRole, availableMemoryBytes, hasNpuAccelerator, batteryLevelPercent,
                     0L, true, false);
         } catch (RuntimeException e) {
-            Log.w(TAG, "Malformed PeerInfo in ACK from " + serialNumber + "; using placeholder", e);
+            EventLog.w(TAG, "Malformed PeerInfo in ACK from " + serialNumber + "; using placeholder", e);
             return buildPlaceholderPeerInfo(serialNumber, address);
         }
     }
@@ -464,7 +466,7 @@ final class MulticastDiscoveryEngine {
         try {
             listener.onDiscoveryFailed(capability, errorCode, errorMessage);
         } catch (RemoteException e) {
-            Log.w(TAG, "Remote listener failure in onDiscoveryFailed", e);
+            EventLog.w(TAG, "Remote listener failure in onDiscoveryFailed", e);
         }
     }
 
@@ -473,7 +475,7 @@ final class MulticastDiscoveryEngine {
         try {
             listener.onPeerJoined(peer);
         } catch (RemoteException e) {
-            Log.w(TAG, "Remote listener failure in onPeerJoined", e);
+            EventLog.w(TAG, "Remote listener failure in onPeerJoined", e);
         }
     }
 
@@ -482,7 +484,7 @@ final class MulticastDiscoveryEngine {
         try {
             listener.onPeerReady(peerId);
         } catch (RemoteException e) {
-            Log.w(TAG, "Remote listener failure in onPeerReady", e);
+            EventLog.w(TAG, "Remote listener failure in onPeerReady", e);
         }
     }
 
@@ -492,7 +494,7 @@ final class MulticastDiscoveryEngine {
         try {
             listener.onDiscoveryComplete(capability, peers);
         } catch (RemoteException e) {
-            Log.w(TAG, "Remote listener failure in onDiscoveryComplete", e);
+            EventLog.w(TAG, "Remote listener failure in onDiscoveryComplete", e);
         }
     }
 
@@ -503,7 +505,7 @@ final class MulticastDiscoveryEngine {
                 try {
                     return NetworkInterface.getByName(lp.getInterfaceName());
                 } catch (SocketException e) {
-                    Log.w(TAG, "Could not resolve NetworkInterface: " + lp.getInterfaceName(), e);
+                    EventLog.w(TAG, "Could not resolve NetworkInterface: " + lp.getInterfaceName(), e);
                 }
             }
         }

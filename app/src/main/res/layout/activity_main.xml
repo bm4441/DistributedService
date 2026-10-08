@@ -1,28 +1,162 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/screenRoot"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:gravity="center"
-    android:padding="24dp">
+    android:layout_height="match_parent">
 
-    <TextView
-        android:id="@+id/tvStatus"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Service Status: STOPPED"
-        android:textSize="18sp"
-        android:textStyle="bold"
-        android:textColor="#D32F2F"
-        android:layout_marginBottom="32dp" />
+    <!-- The root: MainActivity gives the room that the navigation bar and the keyboard take up as padding at its
+         bottom (see MainActivity.fitToSystemBars()). That makes the scroll view shorter, so the field that is being
+         edited can be scrolled to, and is, instead of lying under the keyboard. -->
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true">
 
-    <Button
-        android:id="@+id/btnToggleService"
-        android:layout_width="240dp"
-        android:layout_height="60dp"
-        android:text="Turn ON Service"
-        android:textSize="16sp"
-        android:backgroundTint="#2E7D32"
-        android:textColor="#FFFFFF" />
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center_horizontal"
+            android:padding="24dp">
 
-</LinearLayout>
+            <!-- Status of the three parts: the service, the log forwarder process, the log server. -->
+            <TextView
+                android:id="@+id/tvStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Service Status: STOPPED"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:textColor="#D32F2F"
+                android:layout_marginTop="16dp" />
+
+            <TextView
+                android:id="@+id/tvForwarderStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Log Forwarder Status: STOPPED"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:textColor="#D32F2F"
+                android:layout_marginTop="8dp" />
+
+            <TextView
+                android:id="@+id/tvServerStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Log Server: DISCONNECTED"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:textColor="#D32F2F"
+                android:layout_marginTop="8dp"
+                android:layout_marginBottom="24dp" />
+
+            <!-- Performance log: the demo application's "PerformanceMetrics" lines, read from logcat and sent to the
+                 dashboard. Since Android 12 the system asks the user to allow that ("Allow one-time access"), and
+                 only while this screen is open: the button asks again, the line under the switch says where it stands. -->
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/swPerfLog"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/perf_log_switch"
+                android:textSize="16sp" />
+
+            <TextView
+                android:id="@+id/tvPerfLogStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/perf_log_status_off"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:textColor="#757575"
+                android:layout_marginTop="8dp" />
+
+            <TextView
+                android:id="@+id/tvPerfLogHint"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:gravity="center_horizontal"
+                android:textSize="14sp"
+                android:textColor="#616161"
+                android:layout_marginTop="4dp" />
+
+            <Button
+                android:id="@+id/btnPerfLogAccess"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:layout_marginBottom="24dp"
+                android:enabled="false"
+                android:text="@string/perf_log_ask" />
+
+            <!-- Log Print: also write every log line to logcat. -->
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/swLogPrint"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Log Print (write logs to logcat)"
+                android:textSize="16sp" />
+
+            <!-- Event Level: the lowest level sent to the server. -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Event Level (sent to the server)"
+                android:textSize="16sp"
+                android:layout_marginTop="20dp" />
+
+            <Spinner
+                android:id="@+id/spEventLevel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="48dp" />
+
+            <!-- Log server address. -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Log server address"
+                android:textSize="16sp"
+                android:layout_marginTop="20dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <EditText
+                    android:id="@+id/etServerAddress"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="ws://192.168.1.10:5000/logs"
+                    android:importantForAutofill="no"
+                    android:imeOptions="actionDone"
+                    android:inputType="textUri"
+                    android:minHeight="48dp"
+                    android:singleLine="true" />
+
+                <Button
+                    android:id="@+id/btnApplyServer"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="Apply" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btnToggleService"
+                android:layout_width="240dp"
+                android:layout_height="60dp"
+                android:layout_marginTop="32dp"
+                android:text="Turn ON Service"
+                android:textSize="16sp"
+                android:backgroundTint="#2E7D32"
+                android:textColor="#FFFFFF" />
+
+        </LinearLayout>
+
+    </ScrollView>
+
+</FrameLayout>

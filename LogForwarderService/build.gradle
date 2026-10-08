@@ -1,0 +1,37 @@
+plugins {
+    alias(libs.plugins.android.library)
+}
+
+// The log forwarding of the Distributed Service, in a folder of its own: EventLog (what the service logs through), the
+// LogForwarderService that runs in its own process (":log_forwarder") and streams the log events to the dashboard server over a
+// WebSocket, and what they need. The classes stay in the package com.zebra.ai.distributed, as they were: the app uses them
+// from there. Only the Gradle namespace below is different, because two modules cannot have the same one. The service itself
+// and the READ_LOGS permission are declared in the app's manifest.
+android {
+    namespace 'com.zebra.ai.distributed.logforwarder'
+    compileSdk {
+        version = release(37) {
+            minorApiLevel = 1
+        }
+    }
+
+    defaultConfig {
+        minSdk 33
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+}
+
+dependencies {
+    // WebSocket client of the log-forwarder process (LogForwarderService), which streams the
+    // service's log events to the dashboard server. Separate from gRPC's own, older, OkHttp.
+    implementation libs.okhttp
+
+    // androidx.annotation and androidx.core (ContextCompat), which the service uses.
+    implementation libs.appcompat
+
+    testImplementation libs.junit
+}

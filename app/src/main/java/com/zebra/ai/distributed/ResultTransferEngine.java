@@ -2,7 +2,6 @@ package com.zebra.ai.distributed;
 
 import android.os.RemoteException;
 import android.os.SystemClock;
-import android.util.Log;
 
 import com.google.protobuf.ByteString;
 
@@ -92,13 +91,13 @@ final class ResultTransferEngine {
      */
     synchronized void startResultTransferThread() {
         if (mResultTransferExecutor != null) {
-            Log.d(TAG, "Result transfer thread already running; reusing it");
+            EventLog.d(TAG, "Result transfer thread already running; reusing it");
             return;
         }
         mResultTransferExecutor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
                 new LinkedBlockingQueue<>(), new LoggingThreadFactory("ResultTransfer"));
         mResultTransferExecutor.prestartCoreThread();
-        Log.i(TAG, "Started result transfer thread");
+        EventLog.i(TAG, "Started result transfer thread");
     }
 
     /**
@@ -115,7 +114,7 @@ final class ResultTransferEngine {
         }
         if (executor == null) {
             // Stopped by a release notice (or onDestroy): the sender no longer wants results.
-            Log.w(TAG, "Dropping result for taskId=" + resultEnvelope.taskId
+            EventLog.w(TAG, "Dropping result for taskId=" + resultEnvelope.taskId
                     + ": the result transfer thread is stopped");
             return;
         }
@@ -127,12 +126,12 @@ final class ResultTransferEngine {
                     // sendResultEnvelope() catches what it expects to fail; this only keeps an
                     // unforeseen RuntimeException from killing the result thread -- and, uncaught
                     // on any thread, the whole process.
-                    Log.e(TAG, "Unexpected error sending result for taskId=" + resultEnvelope.taskId, e);
+                    EventLog.e(TAG, "Unexpected error sending result for taskId=" + resultEnvelope.taskId, e);
                 }
             });
         } catch (RejectedExecutionException e) {
             // Stopped between the check above and here -- nothing will send it now.
-            Log.w(TAG, "Dropping result for taskId=" + resultEnvelope.taskId
+            EventLog.w(TAG, "Dropping result for taskId=" + resultEnvelope.taskId
                     + ": the result transfer thread is stopped");
         }
     }
@@ -145,13 +144,13 @@ final class ResultTransferEngine {
      */
     synchronized void shutdownResultTransferThread() {
         if (mResultTransferExecutor == null) {
-            Log.d(TAG, "Result transfer thread already stopped");
+            EventLog.d(TAG, "Result transfer thread already stopped");
             return;
         }
         boolean sending = mResultTransferExecutor.getActiveCount() > 0;
         int dropped = mResultTransferExecutor.shutdownNow().size();
         mResultTransferExecutor = null;
-        Log.i(TAG, "Stopping result transfer thread: " + dropped + " queued result(s) dropped, "
+        EventLog.i(TAG, "Stopping result transfer thread: " + dropped + " queued result(s) dropped, "
                 + (sending ? "interrupting the send in progress" : "no send in progress"));
     }
 
@@ -189,7 +188,7 @@ final class ResultTransferEngine {
         long averageMillis = totalMillis / count;
         long kindBytes = (isResult ? mResultTransferBytes : mTaskTransferBytes).addAndGet(payloadBytes);
         long kindMillis = (isResult ? mResultTransferMillis : mTaskTransferMillis).addAndGet(transferMillis);
-        Log.i(TAG, "taskId=" + taskId + (isResult ? " result transfer time=" : " transfer time=")
+        EventLog.i(TAG, "taskId=" + taskId + (isResult ? " result transfer time=" : " transfer time=")
                 + transferMillis + "ms, payload=" + GrpcTransportEngine.formatSize(payloadBytes)
                 + ", throughput=" + GrpcTransportEngine.formatThroughput(payloadBytes, transferMillis)
                 + " (Avg transfer time=" + averageMillis + "ms, Avg " + (isResult ? "result" : "task")
@@ -215,7 +214,7 @@ final class ResultTransferEngine {
         String targetSerial = resultEnvelope.originatorNodeId;
         PeerInfo originator = svc.mKnownDevices.get(targetSerial);
         if (originator == null) {
-            Log.e(TAG, "Cannot send result for taskId=" + resultEnvelope.taskId + ": originator "
+            EventLog.e(TAG, "Cannot send result for taskId=" + resultEnvelope.taskId + ": originator "
                     + targetSerial + " is unknown.");
             return;
         }
@@ -244,10 +243,10 @@ final class ResultTransferEngine {
                 public void onError(Throwable t) {
                     if (cancelledHere.get()) {
                         // Only our own cancel() below coming back -- its outcome is logged there.
-                        Log.d(TAG, "gRPC result submission stream to " + targetSerial
+                        EventLog.d(TAG, "gRPC result submission stream to " + targetSerial
                                 + " closed after this device cancelled it");
                     } else {
-                        Log.e(TAG, "gRPC result submission stream failed to " + targetSerial, t);
+                        EventLog.e(TAG, "gRPC result submission stream failed to " + targetSerial, t);
                     }
                     latch.countDown();
                 }
@@ -313,19 +312,19 @@ final class ResultTransferEngine {
             long transferMillis = SystemClock.uptimeMillis() - transferStartMillis;
 
             if (success) {
-                Log.i(TAG, "Result for taskId=" + resultEnvelope.taskId + " (" + payload.length
+                EventLog.i(TAG, "Result for taskId=" + resultEnvelope.taskId + " (" + payload.length
                         + " bytes) delivered to " + targetSerial);
                 recordTransferTime(resultEnvelope.taskId, true, payload.length, transferMillis);
             } else if (interrupted) {
-                Log.w(TAG, "Result for taskId=" + resultEnvelope.taskId + " upload to " + targetSerial
+                EventLog.w(TAG, "Result for taskId=" + resultEnvelope.taskId + " upload to " + targetSerial
                         + " stopped after " + transferMillis
                         + " ms: the result transfer thread is shutting down");
             } else {
-                Log.e(TAG, "Result for taskId=" + resultEnvelope.taskId + " delivery to "
+                EventLog.e(TAG, "Result for taskId=" + resultEnvelope.taskId + " delivery to "
                         + targetSerial + " failed or timed out");
             }
         } catch (Exception e) {
-            Log.e(TAG, "Exception sending result for taskId=" + resultEnvelope.taskId
+            EventLog.e(TAG, "Exception sending result for taskId=" + resultEnvelope.taskId
                     + " to " + targetSerial, e);
         }
     }
@@ -345,13 +344,13 @@ final class ResultTransferEngine {
      * to, and to know when to stop tracking it.
      */
     void onResultReceived(DistinctTaskEnvelope envelope) {
-        Log.i(TAG, "Result generated from contributor " + envelope.targetPeerId
+        EventLog.i(TAG, "Result generated from contributor " + envelope.targetPeerId
                 + " for taskId=" + envelope.taskId);
         logRoundTrip(envelope.taskId);
 
         TaskGroup group = mTaskGroups.get(envelope.rootGroupId);
         if (group == null) {
-            Log.w(TAG, "No pending task group for rootGroupId=" + envelope.rootGroupId
+            EventLog.w(TAG, "No pending task group for rootGroupId=" + envelope.rootGroupId
                     + "; dropping result for taskId=" + envelope.taskId);
             return;
         }
@@ -374,7 +373,7 @@ final class ResultTransferEngine {
         long count = mResultCount.incrementAndGet();
         long totalMillis = mTotalRoundTripMillis.addAndGet(roundTripMillis);
         long averageMillis = totalMillis / count;
-        Log.i(TAG, "Round-trip for taskId=" + taskId + ": " + roundTripMillis
+        EventLog.i(TAG, "Round-trip for taskId=" + taskId + ": " + roundTripMillis
                 + " ms (running average over " + count + " result(s): " + averageMillis + " ms)");
     }
 
@@ -392,7 +391,7 @@ final class ResultTransferEngine {
 
         TaskGroup group = mTaskGroups.get(rootGroupId);
         if (group == null) {
-            Log.w(TAG, "No pending task group for rootGroupId=" + rootGroupId
+            EventLog.w(TAG, "No pending task group for rootGroupId=" + rootGroupId
                     + "; dropping failure report for peer " + peerId);
             return;
         }
@@ -412,7 +411,7 @@ final class ResultTransferEngine {
     void cancelTaskGroup(String rootGroupId) {
         TaskGroup group = mTaskGroups.remove(rootGroupId);
         if (group == null) {
-            Log.w(TAG, "cancelTaskGroup: no pending task group for rootGroupId=" + rootGroupId);
+            EventLog.w(TAG, "cancelTaskGroup: no pending task group for rootGroupId=" + rootGroupId);
             return;
         }
         safeOnAllTasksCompleted(group.callback, rootGroupId);
@@ -424,7 +423,7 @@ final class ResultTransferEngine {
         if (reported >= group.expectedCount) {
             mTaskGroups.remove(rootGroupId);
         } else {
-            Log.d(TAG, "rootGroupId=" + rootGroupId + ": " + reported + "/"
+            EventLog.d(TAG, "rootGroupId=" + rootGroupId + ": " + reported + "/"
                     + group.expectedCount + " slice(s) reported so far");
         }
     }
@@ -437,15 +436,15 @@ final class ResultTransferEngine {
     private static void safeOnPartialPeerResult(ITaskResponseCallback callback, String rootGroupId,
                                                 String peerId, DistinctTaskEnvelope resultEnvelope) {
         if (callback == null) {
-            Log.w(TAG, "Result for rootGroupId=" + rootGroupId + " from " + peerId
+            EventLog.w(TAG, "Result for rootGroupId=" + rootGroupId + " from " + peerId
                     + ", but no callback was registered to deliver it to");
             return;
         }
         try {
             callback.onPartialPeerResult(rootGroupId, peerId, resultEnvelope);
-            Log.i(TAG, "onPartialPeerResult delivered for rootGroupId=" + rootGroupId + " from " + peerId);
+            EventLog.i(TAG, "onPartialPeerResult delivered for rootGroupId=" + rootGroupId + " from " + peerId);
         } catch (RemoteException e) {
-            Log.w(TAG, "Remote callback failure in onPartialPeerResult for rootGroupId=" + rootGroupId, e);
+            EventLog.w(TAG, "Remote callback failure in onPartialPeerResult for rootGroupId=" + rootGroupId, e);
         }
     }
 
@@ -453,15 +452,15 @@ final class ResultTransferEngine {
     private static void safeOnPeerTaskFailed(ITaskResponseCallback callback, String rootGroupId,
                                              String peerId, int errorCode, String errorMessage) {
         if (callback == null) {
-            Log.w(TAG, "Peer " + peerId + " failed for rootGroupId=" + rootGroupId + " (" + errorMessage
+            EventLog.w(TAG, "Peer " + peerId + " failed for rootGroupId=" + rootGroupId + " (" + errorMessage
                     + "), but no callback was registered to deliver it to");
             return;
         }
         try {
             callback.onPeerTaskFailed(rootGroupId, peerId, errorCode, errorMessage);
-            Log.i(TAG, "onPeerTaskFailed delivered for rootGroupId=" + rootGroupId + ", peer=" + peerId);
+            EventLog.i(TAG, "onPeerTaskFailed delivered for rootGroupId=" + rootGroupId + ", peer=" + peerId);
         } catch (RemoteException e) {
-            Log.w(TAG, "Remote callback failure in onPeerTaskFailed for rootGroupId=" + rootGroupId, e);
+            EventLog.w(TAG, "Remote callback failure in onPeerTaskFailed for rootGroupId=" + rootGroupId, e);
         }
     }
 
@@ -473,15 +472,15 @@ final class ResultTransferEngine {
      */
     private static void safeOnAllTasksCompleted(ITaskResponseCallback callback, String rootGroupId) {
         if (callback == null) {
-            Log.w(TAG, "Cancelled rootGroupId=" + rootGroupId
+            EventLog.w(TAG, "Cancelled rootGroupId=" + rootGroupId
                     + ", but no callback was registered to deliver it to");
             return;
         }
         try {
             callback.onAllTasksCompleted(rootGroupId, Collections.emptyList());
-            Log.i(TAG, "onAllTasksCompleted (cancellation) delivered for rootGroupId=" + rootGroupId);
+            EventLog.i(TAG, "onAllTasksCompleted (cancellation) delivered for rootGroupId=" + rootGroupId);
         } catch (RemoteException e) {
-            Log.w(TAG, "Remote callback failure in onAllTasksCompleted for rootGroupId=" + rootGroupId, e);
+            EventLog.w(TAG, "Remote callback failure in onAllTasksCompleted for rootGroupId=" + rootGroupId, e);
         }
     }
 

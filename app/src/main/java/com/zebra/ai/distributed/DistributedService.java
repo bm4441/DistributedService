@@ -22,7 +22,6 @@ import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.IBinder;
 import android.provider.Settings;
-import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 
@@ -35,6 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Foreground service tying together the five engines that used to all live in this one file
@@ -64,8 +64,31 @@ public class DistributedService extends Service {
     private static final String CHANNEL_ID = "DistributedServiceChannel";
     private static final int NOTIFICATION_ID = 2001;
 
+    // The global setting that holds this device's serial number -- see getLocalSerialNumber().
+    private static final String SERIAL_SETTING_KEY = "distributed_service_serial";
+
+    // How often the "device" message (the device's name and stats) goes to the dashboard -- see sendDeviceStatus().
+    private static final long DEVICE_MESSAGE_PERIOD_SECONDS = 1;
+
     private final NetworkInterfaceServiceImpl mNetworkInterfaceBinder = new NetworkInterfaceServiceImpl(this);
     private volatile String mLocalSerialNumber;
+
+    // How much of the time the models are being warmed up or run -- the DSP/NPU usage the dashboard shows (see BusyMeter).
+    final BusyMeter mInferenceMeter = new BusyMeter();
+
+    // The conditions the device must meet for the service to run (battery, temperature) and the latest verdict on them. Judged
+    // on every device reading, on the scheduler thread (the only one that touches the two fields after it); nothing acts on it yet.
+    private final ServicePolicy mServicePolicy = new ServicePolicy();
+    private volatile ServicePolicy.Decision mPolicyDecision;
+    private String mLastPolicyKey;
+    private boolean mFirstPolicyReading = true;
+
+    // A Contributor until an application binds to the service, a Requestor while one is bound -- see onBind(). Written on the
+    // main thread, where the service's lifecycle callbacks run, and read from any thread.
+    private volatile ServiceMode mServiceMode = ServiceMode.CONTRIBUTOR;
+    // The bindings that are open. Android calls onBind() for the first client of an intent and onUnbind() when the last
+    // client of that intent is gone, so those two (and onRebind()) are what is counted. Main thread only.
+    private int mOpenBindings;
 
     /* ================= Wi-Fi Callbacks ================= */
     volatile Network mWifiNetwork;
@@ -75,7 +98,7 @@ public class DistributedService extends Service {
             new ConnectivityManager.NetworkCallback() {
                 @Override
                 public void onAvailable(@NonNull Network network) {
-                    Log.i(TAG, "Wi-Fi connected on network " + network);
+                    EventLog.i(TAG, "Wi-Fi connected on network " + network);
                     mWifiNetwork = network;
                     mDiscoveryEngine.startMulticastListener(network);
                     mTransferExecutor.execute(mGrpcEngine::startTransferServer);
@@ -83,7 +106,7 @@ public class DistributedService extends Service {
 
                 @Override
                 public void onLost(@NonNull Network network) {
-                    Log.i(TAG, "Wi-Fi disconnected from network " + network);
+                    EventLog.i(TAG, "Wi-Fi disconnected from network " + network);
                     mWifiNetwork = null;
                     mKnownDevices.clear();
                     mDiscoveryEngine.mPendingRequests.clear();
@@ -113,8 +136,16 @@ public class DistributedService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        // First, so everything below -- and the crash logger -- already logs through it. This also
+        // starts the log-forwarder process (see EventLog.init()).
+        EventLog.init(this);
         installCrashLogger();
         createNotificationChannel();
+        // A new service has no application bound yet, so it starts as a Contributor (an application that started it by
+        // binding is reported by onBind(), right after this).
+        logServiceMode("the service started; no application is bound");
+        // From the start, so the dashboard knows this device's name at once (starting the SDK below can take a while).
+        mScheduler.scheduleWithFixedDelay(this::sendDeviceStatus, 0, DEVICE_MESSAGE_PERIOD_SECONDS, TimeUnit.SECONDS);
         initializeLenderHandlers();
     }
 
@@ -124,6 +155,8 @@ public class DistributedService extends Service {
      * have anyway. The system's own crash report goes to the AndroidRuntime tag, which a
      * "logcat -s DistributedService" filter hides. Native crashes (inside the SDK's .so libraries)
      * aren't Java exceptions and don't come through here -- those need "logcat -b crash".
+     * Goes through EventLog.fatal(): always written to logcat, whatever the Log Print setting,
+     * and the events still queued are handed to the forwarder before the process dies.
      */
     private static void installCrashLogger() {
         if (sCrashLoggerInstalled) {
@@ -132,7 +165,7 @@ public class DistributedService extends Service {
         sCrashLoggerInstalled = true;
         Thread.UncaughtExceptionHandler systemHandler = Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
-            Log.e(TAG, "FATAL: uncaught exception on thread " + thread.getName()
+            EventLog.fatal(TAG, "FATAL: uncaught exception on thread " + thread.getName()
                     + " -- the process is about to crash", throwable);
             if (systemHandler != null) {
                 systemHandler.uncaughtException(thread, throwable);
@@ -157,9 +190,9 @@ public class DistributedService extends Service {
     private void initializeLenderHandlers() {
         try {
             boolean initialized = AIVisionSDK.getInstance(this).init();
-            Log.i(TAG, "AIVisionSDK.init() " + (initialized ? "succeeded" : "returned false"));
+            EventLog.i(TAG, "AIVisionSDK.init() " + (initialized ? "succeeded" : "returned false"));
         } catch (Exception e) {
-            Log.e(TAG, "AIVisionSDK.init() failed", e);
+            EventLog.e(TAG, "AIVisionSDK.init() failed", e);
         }
     }
 
@@ -172,7 +205,7 @@ public class DistributedService extends Service {
         broadcastState(true);
 
         if (!mDiscoveryEngine.isListening() && mConnectivityManager == null) {
-            Log.i(TAG, GREETING + " [onStartCommand - Initializing]");
+            EventLog.i(TAG, GREETING + " [onStartCommand - Initializing]");
 
             mConnectivityManager = getSystemService(ConnectivityManager.class);
             if (mConnectivityManager != null) {
@@ -183,20 +216,67 @@ public class DistributedService extends Service {
                             .build();
                     mConnectivityManager.registerNetworkCallback(wifiRequest, mWifiNetworkCallback);
                 } catch (Exception e) {
-                    Log.e(TAG, "Failed to register network callback", e);
+                    EventLog.e(TAG, "Failed to register network callback", e);
                 }
             }
         } else {
-            Log.i(TAG, "DistributedService already active, ignoring redundant start.");
+            EventLog.i(TAG, "DistributedService already active, ignoring redundant start.");
         }
 
         return START_STICKY;
     }
 
+    /** An application bound to the service: it is a Requestor from now on. */
     @Nullable
     @Override
     public IBinder onBind(Intent intent) {
+        applicationBound();
         return mNetworkInterfaceBinder;
+    }
+
+    /**
+     * The last application that bound with this intent is gone. Returns true so that onRebind() is called when an
+     * application binds again: Android calls onBind() only the first time.
+     */
+    @Override
+    public boolean onUnbind(Intent intent) {
+        applicationUnbound();
+        return true;
+    }
+
+    /** An application binds again, after the last one had unbound (see onUnbind()). */
+    @Override
+    public void onRebind(Intent intent) {
+        super.onRebind(intent);
+        applicationBound();
+    }
+
+    /** The service's mode: a Requestor while an application is bound to it, a Contributor otherwise. */
+    ServiceMode getServiceMode() {
+        return mServiceMode;
+    }
+
+    private void applicationBound() {
+        mOpenBindings++;
+        if (mServiceMode != ServiceMode.REQUESTOR) {
+            mServiceMode = ServiceMode.REQUESTOR;
+            logServiceMode("an application bound to the service");
+        }
+    }
+
+    private void applicationUnbound() {
+        if (mOpenBindings > 0) {
+            mOpenBindings--;
+        }
+        if (mOpenBindings == 0 && mServiceMode != ServiceMode.CONTRIBUTOR) {
+            mServiceMode = ServiceMode.CONTRIBUTOR;
+            logServiceMode("the last application unbound from the service");
+        }
+    }
+
+    /** Info, so that it also reaches the dashboard server at the default Event Level. */
+    private void logServiceMode(String why) {
+        EventLog.i(TAG, "The Service Mode: " + mServiceMode.label + " (" + why + ")");
     }
 
     @Override
@@ -231,13 +311,16 @@ public class DistributedService extends Service {
                     try {
                         handler.dispose();
                     } catch (Exception e) {
-                        Log.w(TAG, "Error disposing LenderHandler", e);
+                        EventLog.w(TAG, "Error disposing LenderHandler", e);
                     }
                 }
             }
         }
 
-        Log.i(TAG, "DistributedService destroyed and stopped.");
+        EventLog.i(TAG, "DistributedService destroyed and stopped.");
+        // Last: delivers the final events to the forwarder, then unbinds it so it flushes to the
+        // server and stops.
+        EventLog.shutdown();
     }
 
     private void broadcastState(boolean isRunning) {
@@ -280,28 +363,106 @@ public class DistributedService extends Service {
         }
     }
 
+    /**
+     * This device's id: its serial number -- the system property ro.serialno, e.g. "252695242D0034" -- which an app cannot
+     * read itself. It is put once on each device, from a PC, in the global setting distributed_service_serial:
+     *     adb shell 'settings put global distributed_service_serial $(getprop ro.serialno)'
+     * and the service reads it from there when it starts, so after running it start the service again. A device without
+     * that setting keeps the id it had before: the Android ID, and for an emulator a name made from the model. Read once;
+     * the line "Local serial number: <id>" is matched by the dashboard server, keep its form.
+     */
     @SuppressLint("HardwareIds")
     String getLocalSerialNumber() {
         if (mLocalSerialNumber == null) {
             synchronized (this) {
                 if (mLocalSerialNumber == null) {
-                    // Uses Android 64-bit unique device ID (safe for non-system APKs)
-                    String deviceId = Settings.Secure.getString(
-                            getContentResolver(),
-                            Settings.Secure.ANDROID_ID
-                    );
-
-                    if (deviceId != null && !deviceId.trim().isEmpty() && !"null".equalsIgnoreCase(deviceId)) {
-                        mLocalSerialNumber = deviceId;
+                    String serial = readSerialNumberSetting();
+                    if (serial != null) {
+                        mLocalSerialNumber = serial;
                     } else {
-                        // Fallback in case of emulator or unique testing environment
-                        mLocalSerialNumber = "DEV_" + Build.MODEL.replaceAll("[^a-zA-Z0-9]", "_");
+                        // Uses Android 64-bit unique device ID (safe for non-system APKs)
+                        String deviceId = Settings.Secure.getString(
+                                getContentResolver(),
+                                Settings.Secure.ANDROID_ID
+                        );
+
+                        if (deviceId != null && !deviceId.trim().isEmpty() && !"null".equalsIgnoreCase(deviceId)) {
+                            mLocalSerialNumber = deviceId;
+                        } else {
+                            // Fallback in case of emulator or unique testing environment
+                            mLocalSerialNumber = "DEV_" + Build.MODEL.replaceAll("[^a-zA-Z0-9]", "_");
+                        }
                     }
-                    Log.i(TAG, "Local serial number: " + mLocalSerialNumber);
+                    EventLog.i(TAG, "Local serial number: " + mLocalSerialNumber);
+                    if (serial == null) {
+                        EventLog.w(TAG, "This device's id is not its serial number. To use it, run once from a PC: adb shell 'settings put global "
+                                + SERIAL_SETTING_KEY + " $(getprop ro.serialno)' and start the service again");
+                    }
                 }
             }
         }
         return mLocalSerialNumber;
+    }
+
+    /**
+     * The serial number in the global setting distributed_service_serial, or null if there is none to use: the setting is not
+     * there, or holds something that cannot be an id. The ids travel in "|"-separated messages, so only letters, digits, "."
+     * "_" and "-" are accepted (a serial number is made of that), and not a placeholder such as "unknown".
+     */
+    private String readSerialNumberSetting() {
+        String value = Settings.Global.getString(getContentResolver(), SERIAL_SETTING_KEY);
+        if (value == null) {
+            return null;
+        }
+        value = value.trim();
+        if (!value.matches("[A-Za-z0-9._-]{1,64}") || "unknown".equalsIgnoreCase(value) || "null".equalsIgnoreCase(value)) {
+            EventLog.w(TAG, "Ignoring the setting " + SERIAL_SETTING_KEY + ": '" + value + "' is not a serial number");
+            return null;
+        }
+        return value;
+    }
+
+    /**
+     * Tells the dashboard what this device is and how it is doing: a "device" message with its id and model and its
+     * stats -- the battery percentage, the available memory and the DSP/NPU usage (see DeviceStats). The log forwarder
+     * process adds the product name (ro.product.name, "TC501W") as the message passes through -- the dashboard calls the
+     * device by that name, "TC501W-1" when several share it, and picks its icon by it. The dashboard expects a status
+     * every few seconds, so this runs on the scheduler from the start of the service. The forwarder keeps only the newest
+     * and sends it again whenever its connection to the server is (re)established, so a server that is started later gets
+     * it too.
+     */
+    private void sendDeviceStatus() {
+        try {
+            DeviceStats stats = DeviceStats.read(this, mInferenceMeter);
+            ServicePolicy.Decision decision = mServicePolicy.evaluate(stats);
+            mPolicyDecision = decision;
+            logPolicyIfChanged(decision);
+            EventLog.sendDeviceStatus(stats.toJson(getLocalSerialNumber(), Build.MODEL, System.currentTimeMillis(), decision));
+        } catch (RuntimeException e) {
+            // A task on the scheduler that throws is never run again: say so, and try again at the next period.
+            EventLog.e(TAG, "Could not send the device's status to the dashboard", e);
+        }
+    }
+
+    /** The service policy's latest verdict (see ServicePolicy); null until the first reading, a moment after the service starts. */
+    ServicePolicy.Decision getServicePolicyDecision() {
+        return mPolicyDecision;
+    }
+
+    /**
+     * Logs the verdict the first time and whenever a rule's verdict changes -- not with every reading. Info, so that it
+     * also reaches the dashboard at the default Event Level. For now the policy is only reported: nothing acts on it yet.
+     */
+    private void logPolicyIfChanged(ServicePolicy.Decision decision) {
+        if (mFirstPolicyReading) {
+            mFirstPolicyReading = false;
+            EventLog.i(TAG, "Service policy: " + mServicePolicy.describe());
+        }
+        if (decision.key.equals(mLastPolicyKey)) {
+            return;
+        }
+        mLastPolicyKey = decision.key;
+        EventLog.i(TAG, "Service policy " + (decision.met ? "met" : "NOT met") + ": " + decision.summary);
     }
 
     /* =========================================================================

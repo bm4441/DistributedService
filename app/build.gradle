@@ -89,6 +89,10 @@ dependencies {
     // which will be wired up for actual processing later.
     implementation files('libs/emc-ai-suite-release-4.1.0.aar')
 
+    // product.embed_lookup's barcode model, packaged as an asset-only AAR (empty classes.jar,
+    // just assets/barcode-decoder/*.tar.crypt) -- see the subtask handler in PeerReadinessEngine.
+    implementation files('libs/barcode-decoder-6.0.1.aar')
+
     // ocr.recognize's model, packaged as an asset-only AAR (empty classes.jar, just
     // assets/text-ocr-recognizer/*.tar.crypt) -- TextOCR.Settings' constructor loads this
     // eagerly, which is what LenderHandler.prepare() hits when warming this capability.
@@ -103,6 +107,9 @@ dependencies {
     implementation libs.grpc.protobuf.lite
     implementation libs.grpc.stub
     implementation libs.javax.annotation.api
+
+    // The log forwarding (EventLog, the LogForwarderService process and its WebSocket client), in its own folder.
+    implementation project(':LogForwarderService')
 
     testImplementation libs.junit
     androidTestImplementation libs.espresso.core
