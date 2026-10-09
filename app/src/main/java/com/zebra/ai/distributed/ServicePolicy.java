@@ -24,6 +24,11 @@ final class ServicePolicy {
     /** The battery must be LESS than this warm (degrees Celsius). */
     static final float MAX_TEMPERATURE_C = 50.0f;
 
+    /** How long the policy must keep being met before a paused service starts its engines again. */
+    static final long START_AFTER_MILLIS = 5_000;
+    /** How long the policy must keep failing before a running service stops its engines. */
+    static final long STOP_AFTER_MILLIS = 2_000;
+
     /** The verdict of one rule on one reading. */
     static final class RuleResult {
         final String id;
@@ -179,6 +184,69 @@ final class ServicePolicy {
             String value = String.format(Locale.US, "%.1f °C", s.batteryTempC);
             return new RuleResult("temperature", name(), ok, value, required, "battery",
                     ok ? "" : "temperature " + value + " is not " + required);
+        }
+    }
+
+    /* ================= The gate: turns verdicts into start / stop decisions ================= */
+
+    /**
+     * Keeps the service from starting and stopping with every flicker of the readings (a battery at 20 %, say): a verdict
+     * only takes effect once it has held for a while -- START_AFTER_MILLIS before a stopped service starts, and
+     * STOP_AFTER_MILLIS before a running one stops. The very first verdict acts at once: there is no history to be steadied
+     * against, and a service that begins with the policy not met must not start at all. Not thread-safe: one thread feeds it.
+     */
+    static final class Gate {
+        static final int NONE = 0;
+        static final int START = 1;
+        static final int STOP = -1;
+
+        private final long mStartAfterMillis;
+        private final long mStopAfterMillis;
+        private boolean mActive;
+        private boolean mJudgedOnce;
+        /** When the opposite verdict was first seen, or -1 while the verdict agrees with the state. */
+        private long mDisagreeSinceMillis = -1;
+
+        Gate(long startAfterMillis, long stopAfterMillis) {
+            mStartAfterMillis = startAfterMillis;
+            mStopAfterMillis = stopAfterMillis;
+        }
+
+        /** Feeds one verdict; returns START or STOP when the state changes now, otherwise NONE. */
+        int update(boolean met, long nowMillis) {
+            if (!mJudgedOnce) {
+                mJudgedOnce = true;
+                mActive = met;
+                return met ? START : NONE;
+            }
+            if (met == mActive) {
+                mDisagreeSinceMillis = -1;
+                return NONE;
+            }
+            if (mDisagreeSinceMillis < 0) {
+                mDisagreeSinceMillis = nowMillis;
+            }
+            long required = met ? mStartAfterMillis : mStopAfterMillis;
+            if (nowMillis - mDisagreeSinceMillis >= required) {
+                mActive = met;
+                mDisagreeSinceMillis = -1;
+                return met ? START : STOP;
+            }
+            return NONE;
+        }
+
+        /** Milliseconds until the pending change takes effect (if the verdict holds), or -1 if none is pending. */
+        long millisUntilChange(long nowMillis) {
+            if (mDisagreeSinceMillis < 0) {
+                return -1;
+            }
+            long required = mActive ? mStopAfterMillis : mStartAfterMillis;
+            return Math.max(0, required - (nowMillis - mDisagreeSinceMillis));
+        }
+
+        /** True while the gate is open (the engines should be running). */
+        boolean isActive() {
+            return mActive;
         }
     }
 }

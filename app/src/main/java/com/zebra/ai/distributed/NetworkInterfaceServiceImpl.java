@@ -42,7 +42,10 @@ final class NetworkInterfaceServiceImpl extends INetworkInterfaceService.Stub {
     public List<PeerInfo> getConnectedPeers() {
         List<PeerInfo> peers = mService.getKnownPeers();
         EventLog.d(TAG, "getConnectedPeers() -> " + peers.size() + " peer(s)");
-        return peers;
+        // The peers above are returned as they are known now; if the last peer discovery is too old a new one starts, and
+        // its answers reach the application through its discovery listener.
+        mService.refreshPeersIfExpired();
+        return mService.getKnownPeers();
     }
 
     @Override

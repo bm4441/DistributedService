@@ -36,6 +36,9 @@ final class TaskTransferEngine {
 
     private static final String TAG = "DistributedService";
 
+    /** What a contributor's reply to a task starts with when it cannot process the task (see onDataReceived()). */
+    static final String TASK_REFUSED_PREFIX = "Can't process the task: ";
+
     private final DistributedService svc;
 
     // Running sum/count backing the all-time average LenderHandler.handle() processing time
@@ -53,10 +56,10 @@ final class TaskTransferEngine {
     // time in arrival order, and hands its result to ResultTransferEngine's result-transfer thread
     // (see processDistinctTask()) -- so processing the next task and sending the previous result
     // happen in parallel. Started just before this device's first ready ack (see
-    // startReceiverThreads()).
-    private final ThreadPoolExecutor mProcessingExecutor = new ThreadPoolExecutor(1, 1, 0L,
-            TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(),
-            new LoggingThreadFactory("TaskProcessing"));
+    // startReceiverThreads()) and stopped when the service becomes a Requestor (finishProcessingThread()) or is
+    // destroyed (shutdownProcessingThread()) -- an executor can't be restarted once it's shut down, hence a new one each
+    // time. null while stopped; guarded by `this`.
+    private ThreadPoolExecutor mProcessingExecutor;
 
     TaskTransferEngine(DistributedService svc) {
         this.svc = svc;
@@ -130,20 +133,85 @@ final class TaskTransferEngine {
      * processed: execute() starts the executor's one thread on first use.
      */
     void startReceiverThreads() {
-        if (mProcessingExecutor.getPoolSize() == 0) {
-            mProcessingExecutor.prestartCoreThread();
-        } else {
+        boolean alreadyRunning;
+        synchronized (this) {
+            alreadyRunning = mProcessingExecutor != null;
+        }
+        if (alreadyRunning) {
             EventLog.d(TAG, "Task processing thread already running; reusing it");
+        } else {
+            processingExecutor();
         }
         svc.mResultEngine.startResultTransferThread();
     }
 
-    /** Stops the task-processing thread -- called from DistributedService.onDestroy(). */
+    /**
+     * The running task-processing executor, starting one (with its thread) if there is none -- but only while the service
+     * is a Contributor: null otherwise, so that a task that was let in just before the service became a Requestor cannot
+     * start the thread again after it was closed (finishProcessingThread()).
+     */
+    private synchronized ThreadPoolExecutor processingExecutor() {
+        if (mProcessingExecutor == null) {
+            if (svc.getServiceMode() != ServiceMode.CONTRIBUTOR || !svc.isServiceActive()) {
+                return null;
+            }
+            ThreadPoolExecutor executor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+                    new LinkedBlockingQueue<>(), new LoggingThreadFactory("TaskProcessing"));
+            executor.prestartCoreThread();
+            mProcessingExecutor = executor;
+        }
+        return mProcessingExecutor;
+    }
+
+    /** Stops the task-processing thread at once, dropping what is queued -- called from DistributedService.onDestroy(). */
     void shutdownProcessingThread() {
-        boolean processing = mProcessingExecutor.getActiveCount() > 0;
-        int dropped = mProcessingExecutor.shutdownNow().size();
+        ThreadPoolExecutor executor;
+        synchronized (this) {
+            executor = mProcessingExecutor;
+            mProcessingExecutor = null;
+        }
+        if (executor == null) {
+            EventLog.d(TAG, "Task processing thread already stopped");
+            return;
+        }
+        boolean processing = executor.getActiveCount() > 0;
+        int dropped = executor.shutdownNow().size();
         EventLog.i(TAG, "Stopping task processing thread: " + dropped + " queued task(s) dropped"
                 + (processing ? ", one still being processed" : ""));
+    }
+
+    /**
+     * Stops the task-processing thread after it has done what it already accepted: no more tasks are taken from now on, the
+     * one being processed and those queued behind it are completed (their results are queued for the result-transfer
+     * thread, see processDistinctTask()), and the thread is released. Waits up to waitMillis for that; whatever is still
+     * running then is interrupted. Called when the service becomes a Requestor (PeerReadinessEngine.leaveContributorRole()).
+     * Returns true if everything accepted was completed. Blocks, so not on the main thread.
+     */
+    boolean finishProcessingThread(long waitMillis) {
+        ThreadPoolExecutor executor;
+        synchronized (this) {
+            executor = mProcessingExecutor;
+            mProcessingExecutor = null;
+        }
+        if (executor == null) {
+            EventLog.d(TAG, "Task processing thread already stopped");
+            return true;
+        }
+        int pending = executor.getQueue().size() + executor.getActiveCount();
+        executor.shutdown();                          // takes no new task; the accepted ones are still run
+        EventLog.i(TAG, "Task processing thread: finishing " + pending + " accepted task(s) before it is released");
+        try {
+            if (executor.awaitTermination(waitMillis, TimeUnit.MILLISECONDS)) {
+                EventLog.i(TAG, "Task processing thread released: every accepted task is completed");
+                return true;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        int dropped = executor.shutdownNow().size();
+        EventLog.w(TAG, "Task processing thread released: the accepted tasks were not completed within " + waitMillis
+                + " ms (" + dropped + " dropped, the one being processed interrupted)");
+        return false;
     }
 
     /**
@@ -167,6 +235,18 @@ final class TaskTransferEngine {
         if (!distinctTaskList.isEmpty()) {
             String rootGroupId = distinctTaskList.get(0).rootGroupId;
             svc.mResultEngine.registerTaskGroup(rootGroupId, callback, distinctTaskList.size());
+        }
+        if (!svc.isServiceActive()) {
+            // Paused by the service policy: nothing is sent, and every slice is reported failed at once.
+            EventLog.w(TAG, "Refusing " + distinctTaskList.size() + " task(s): the service is paused by its policy");
+            for (DistinctTaskEnvelope task : distinctTaskList) {
+                if (task.payloadSharedMemory != null) {
+                    task.payloadSharedMemory.close();
+                }
+                svc.mResultEngine.reportPeerTaskFailed(task.rootGroupId, task.taskId, task.targetPeerId,
+                        ResultTransferEngine.ERROR_SERVICE_PAUSED, "The service is paused by its policy");
+            }
+            return;
         }
         for (DistinctTaskEnvelope task : distinctTaskList) {
             if (task.targetPeerId == null) {
@@ -266,6 +346,10 @@ final class TaskTransferEngine {
 
             CountDownLatch latch = new CountDownLatch(1);
             final boolean[] transferSuccess = new boolean[]{false};
+            // What the peer said in its reply (TransferResponse.message): when it refused the task, why. And whether the
+            // call itself failed (the connection broke), as against being cancelled here.
+            final String[] reply = new String[]{""};
+            final boolean[] callFailed = new boolean[]{false};
             // Set just before this method cancels the call itself (see below), so onError() can tell
             // the CANCELLED that cancel produces apart from a real failure.
             AtomicBoolean cancelledHere = new AtomicBoolean(false);
@@ -274,6 +358,7 @@ final class TaskTransferEngine {
                 @Override
                 public void onNext(TransferResponse value) {
                     transferSuccess[0] = value.getSuccess();
+                    reply[0] = value.getMessage();
                 }
 
                 @Override
@@ -283,7 +368,8 @@ final class TaskTransferEngine {
                         EventLog.d(TAG, "gRPC task submission stream to " + task.targetPeerId
                                 + " closed after this device cancelled it");
                     } else {
-                        EventLog.e(TAG, "gRPC task submission stream failed to " + task.targetPeerId, t);
+                        GrpcTransportEngine.logCallFailure("gRPC task submission stream failed to " + task.targetPeerId, t);
+                        callFailed[0] = true;
                     }
                     latch.countDown();
                 }
@@ -358,8 +444,20 @@ final class TaskTransferEngine {
                 svc.mResultEngine.reportPeerTaskFailed(task.rootGroupId, task.taskId, task.targetPeerId,
                         ResultTransferEngine.ERROR_TRANSFER_FAILED,
                         "Upload stopped: transfer thread shutting down");
+            } else if (completedInTime && !callFailed[0] && reply[0].startsWith(TASK_REFUSED_PREFIX)) {
+                // The peer answered, and said it cannot process the task: report it lost, so the application stops using it.
+                EventLog.w(TAG, "Task " + task.taskId + " was refused by " + task.targetPeerId + ": " + reply[0]);
+                svc.mReadinessEngine.tellPeerLost(task.targetPeerId, reply[0]);
+                svc.mResultEngine.reportPeerTaskFailed(task.rootGroupId, task.taskId, task.targetPeerId,
+                        ResultTransferEngine.ERROR_TRANSFER_FAILED, reply[0]);
             } else {
                 EventLog.e(TAG, "Task " + task.taskId + " delivery to " + task.targetPeerId + " failed or timed out");
+                // The peer broke the connection or did not answer in time: it is disconnected or not responding. (A peer that
+                // answered, but could not decode the task, is not lost: the task alone failed.)
+                if (!completedInTime || callFailed[0]) {
+                    svc.mReadinessEngine.tellPeerLost(task.targetPeerId,
+                            "it did not take task " + task.taskId + " (disconnected or not responding)");
+                }
                 svc.mResultEngine.reportPeerTaskFailed(task.rootGroupId, task.taskId, task.targetPeerId,
                         ResultTransferEngine.ERROR_TRANSFER_FAILED, "Task delivery failed or timed out");
             }
@@ -377,7 +475,7 @@ final class TaskTransferEngine {
      * sendResponseBackToRoot / ITaskResponseCallback) is a later step. This only confirms the
      * transfer itself works.
      */
-    void onDataReceived(DistinctTaskEnvelope envelope) {
+    String onDataReceived(DistinctTaskEnvelope envelope) {
         EventLog.i(TAG, "onDataReceived: rootGroupId=" + envelope.rootGroupId //ocr_recognise
                 + ", taskId=" + envelope.taskId
                 + ", originatorNodeId=" + envelope.originatorNodeId
@@ -401,17 +499,52 @@ final class TaskTransferEngine {
         // found there can only be a result coming back for a task *we* submitted.
         if (svc.mResultEngine.isTrackingGroup(envelope.rootGroupId)) {
             svc.mResultEngine.onResultReceived(envelope);
-        } else {
-            // Hands the task to the processing thread, which startReceiverThreads() already started
-            // before this device's ready ack: execute() only adds the task to that one thread's
-            // queue -- it never starts another thread (the executor is fixed at exactly one).
-            try {
-                mProcessingExecutor.execute(() -> processDistinctTask(envelope));
-            } catch (RejectedExecutionException e) {
-                // Only after shutdownProcessingThread() (onDestroy) -- nothing will process it now.
-                EventLog.w(TAG, "Dropping taskId=" + envelope.taskId + ": the processing thread is stopped");
-            }
+            return null;
         }
+
+        // A task for this device to do -- if it can: it must be a Contributor, reserved for this sender (or for nobody),
+        // with the capability's handler warm. Otherwise the task is refused, with the reason in the reply: the sender
+        // reports this device lost, instead of waiting for a result that will never come.
+        String reason = null;
+        ServiceMode mode = svc.getServiceMode();
+        String reservedFor = svc.mReadinessEngine.getReservedFor();
+        if (!svc.isServiceActive()) {
+            reason = "the service is paused by its policy";
+        } else if (mode != ServiceMode.CONTRIBUTOR) {
+            reason = "the service is in " + mode.label + " mode, not Contributor";
+        } else if (reservedFor != null && envelope.originatorNodeId != null
+                && !reservedFor.equals(envelope.originatorNodeId)) {
+            reason = "this device is reserved for another requestor";
+        } else if (!svc.mReadinessEngine.mLenderHandlers.containsKey(envelope.capability)) {
+            reason = "it is not ready for capability '" + envelope.capability + "'";
+        }
+        if (reason != null) {
+            EventLog.w(TAG, "Refusing taskId=" + envelope.taskId + " from " + envelope.originatorNodeId + ": " + reason);
+            if (envelope.payloadSharedMemory != null) {
+                envelope.payloadSharedMemory.close();     // nothing will use it: free it now, not when the collector gets to it
+            }
+            return TASK_REFUSED_PREFIX + reason;
+        }
+
+        // Hands the task to the processing thread, which startReceiverThreads() already started
+        // before this device's ready ack: execute() only adds the task to that one thread's
+        // queue -- it never starts another thread (the executor is fixed at exactly one).
+        try {
+            ThreadPoolExecutor executor = processingExecutor();
+            if (executor == null) {
+                throw new RejectedExecutionException("not a Contributor");
+            }
+            executor.execute(() -> processDistinctTask(envelope));
+        } catch (RejectedExecutionException e) {
+            // The thread was just closed -- the service became a Requestor (finishProcessingThread()) or is being destroyed
+            // -- between the checks above and here: the task is refused, so that its sender is told and does not wait.
+            EventLog.w(TAG, "Refusing taskId=" + envelope.taskId + ": the processing thread has just been closed");
+            if (envelope.payloadSharedMemory != null) {
+                envelope.payloadSharedMemory.close();
+            }
+            return TASK_REFUSED_PREFIX + "this device has just stopped taking tasks";
+        }
+        return null;
     }
 
     /**

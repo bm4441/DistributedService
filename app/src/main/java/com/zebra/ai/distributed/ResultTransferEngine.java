@@ -37,6 +37,7 @@ final class ResultTransferEngine {
     // The peer's transfer queue was full, so the task was never sent -- see
     // PeerTransferWorker.MAX_QUEUED_TASKS.
     static final int ERROR_PEER_BUSY = 4;
+    static final int ERROR_SERVICE_PAUSED = 5;
 
     // One entry per in-flight submitDistinctTasks() call, keyed by the shared rootGroupId all of
     // its slices carry -- see TaskGroup/onResultReceived().
@@ -154,6 +155,40 @@ final class ResultTransferEngine {
                 + (sending ? "interrupting the send in progress" : "no send in progress"));
     }
 
+    /**
+     * Stops the result-transfer thread after it has sent the results already queued: no new result is queued from now on,
+     * those waiting are sent, and the thread is released. Waits up to waitMillis; a send still going on then is interrupted
+     * and the results behind it are dropped. Called when the service becomes a Requestor, after its processing thread has
+     * finished (PeerReadinessEngine.leaveContributorRole()), so that the results of the tasks it completed reach their
+     * originator. Returns true if every queued result was sent. Blocks, so not on the main thread.
+     */
+    boolean finishResultTransferThread(long waitMillis) {
+        ThreadPoolExecutor executor;
+        synchronized (this) {
+            executor = mResultTransferExecutor;
+            mResultTransferExecutor = null;
+        }
+        if (executor == null) {
+            EventLog.d(TAG, "Result transfer thread already stopped");
+            return true;
+        }
+        int pending = executor.getQueue().size() + executor.getActiveCount();
+        executor.shutdown();                          // takes no new result; the queued ones are still sent
+        EventLog.i(TAG, "Result transfer thread: sending " + pending + " queued result(s) before it is released");
+        try {
+            if (executor.awaitTermination(waitMillis, TimeUnit.MILLISECONDS)) {
+                EventLog.i(TAG, "Result transfer thread released: every queued result is sent");
+                return true;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        int dropped = executor.shutdownNow().size();
+        EventLog.w(TAG, "Result transfer thread released: the queued results were not all sent within " + waitMillis
+                + " ms (" + dropped + " dropped, the send in progress interrupted)");
+        return false;
+    }
+
     /** Registers a new TaskGroup for a rootGroupId -- called from TaskTransferEngine.submitDistinctTasks(). */
     void registerTaskGroup(String rootGroupId, ITaskResponseCallback callback, int expectedCount) {
         mTaskGroups.put(rootGroupId, new TaskGroup(callback, expectedCount));
@@ -246,7 +281,7 @@ final class ResultTransferEngine {
                         EventLog.d(TAG, "gRPC result submission stream to " + targetSerial
                                 + " closed after this device cancelled it");
                     } else {
-                        EventLog.e(TAG, "gRPC result submission stream failed to " + targetSerial, t);
+                        GrpcTransportEngine.logCallFailure("gRPC result submission stream failed to " + targetSerial, t);
                     }
                     latch.countDown();
                 }
@@ -415,6 +450,16 @@ final class ResultTransferEngine {
             return;
         }
         safeOnAllTasksCompleted(group.callback, rootGroupId);
+    }
+
+    /**
+     * The service is paused by its policy: every task group still waiting for results is ended the way a cancellation ends
+     * it (see cancelTaskGroup()), so the application is not left waiting for results that will not come.
+     */
+    void cancelAllTaskGroups() {
+        for (String rootGroupId : new java.util.ArrayList<>(mTaskGroups.keySet())) {
+            cancelTaskGroup(rootGroupId);
+        }
     }
 
     /** Shared bookkeeping for both success (onResultReceived) and failure (reportPeerTaskFailed) paths. */

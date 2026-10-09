@@ -35,10 +35,12 @@ final class DeviceStats {
     long npuLastTaskMillis = -1;
 
     /**
-     * Reads the stats now. The NPU usage is the share of time since the previous call during which the models were busy
-     * (BusyMeter.sampleBusyPercent()), so call this from one place only, at regular intervals.
+     * Reads the stats now. The NPU usage is the share of time since the previous sample during which the models were busy
+     * (BusyMeter.sampleBusyPercent()), so it is sampled by the regular status reading only (sampleBusy = true). A reading
+     * made for another reason -- the policy check when the battery changes -- passes false: the NPU usage is then left
+     * unknown, and the sampling window of the regular reading is not cut short.
      */
-    static DeviceStats read(Context context, BusyMeter inferenceMeter) {
+    static DeviceStats read(Context context, BusyMeter inferenceMeter, boolean sampleBusy) {
         DeviceStats stats = new DeviceStats();
 
         // The sticky battery broadcast: reading it needs no receiver, and is always current.
@@ -71,7 +73,9 @@ final class DeviceStats {
 
         // Android gives an app no reading of the real DSP/NPU load; this service is the only thing on the device that
         // drives the models, so the share of time they were busy running them (see BusyMeter) is the figure it offers.
-        stats.npuBusyPercent = inferenceMeter.sampleBusyPercent(System.nanoTime());
+        if (sampleBusy) {
+            stats.npuBusyPercent = inferenceMeter.sampleBusyPercent(System.nanoTime());
+        }
         stats.npuTasksProcessed = inferenceMeter.completedCount();
         stats.npuLastTaskMillis = inferenceMeter.lastDurationMillis();
         return stats;
@@ -83,13 +87,19 @@ final class DeviceStats {
      * "battery":{...},"memory":{...},"npu":{...},"policy":{...}} -- the members the dashboard reads (see fleet.py,
      * _clean_status). The forwarder adds the product name ("TC501W") as it passes the message on (see ProductName).
      */
-    String toJson(String deviceId, String model, long timeMillis, ServicePolicy.Decision policy) {
+    String toJson(String deviceId, String model, long timeMillis, ServicePolicy.Decision policy,
+                  String serviceState, long serviceSinceMillis) {
         JsonText json = new JsonText().beginObject();
         json.key("type").str(MESSAGE_TYPE);
         json.key("source").str(SOURCE_NAME);
         json.key("ts").num(timeMillis);
         json.key("deviceId").str(deviceId);
         json.key("model").str(model);
+
+        json.key("service").beginObject();
+        json.key("state").str(serviceState);           // ACTIVE | STARTING | PAUSED -- what the dashboard shows on the card
+        json.key("sinceTs").num(serviceSinceMillis);
+        json.endObject();
 
         json.key("battery").beginObject();
         json.key("present").bool(batteryPresent);

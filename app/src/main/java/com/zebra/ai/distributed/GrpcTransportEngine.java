@@ -46,6 +46,12 @@ final class GrpcTransportEngine {
     // that capability's handler and resume discoverability -- see PeerReadinessEngine.
     // stopPeerDiscovery()/sendReleaseNotice().
     static final String RELEASE_FILE_NAME_MARKER = "__RELEASE__";
+    // Sentinel for the notice a contributor sends the requestor that holds it when it becomes a Requestor itself: it takes
+    // no more tasks -- see PeerReadinessEngine.leaveContributorRole()/handleWithdrawReceived().
+    static final String WITHDRAW_FILE_NAME_MARKER = "__WITHDRAW__";
+    // Sentinel for the sign of life a requestor sends every few seconds to each contributor it holds: a contributor that
+    // hears nothing from the requestor it is reserved for lets it go -- see PeerReadinessEngine.sendHoldBeats()/handleHoldReceived().
+    static final String HOLD_FILE_NAME_MARKER = "__HOLD__";
 
     final ConcurrentHashMap<String, ManagedChannel> mChannelPool = new ConcurrentHashMap<>();
     private final Object mTransferServerLock = new Object();
@@ -65,6 +71,10 @@ final class GrpcTransportEngine {
 
     void startTransferServer() {
         synchronized (mTransferServerLock) {
+            if (!svc.isServiceActive()) {
+                EventLog.i(TAG, "Not starting the gRPC transfer server: the service is paused by its policy");
+                return;
+            }
             if (isTransferServerActive()) {
                 return;
             }
@@ -108,6 +118,46 @@ final class GrpcTransportEngine {
                 } finally {
                     mGrpcServer = null;
                 }
+            }
+        }
+    }
+
+    /**
+     * Logs a gRPC call that failed. A peer that cannot be reached -- its Wi-Fi is off, its service is stopped (the
+     * connection is refused), it does not answer in time -- is an expected event, which is handled by reporting the peer lost
+     * (see PeerReadinessEngine.tellPeerLost()): it is one warning line with the reason, without the stack trace. Any other
+     * failure is unexpected and is logged as an error, with its stack trace.
+     */
+    static void logCallFailure(String what, Throwable t) {
+        Status status = Status.fromThrowable(t);
+        Status.Code code = status.getCode();
+        if (code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED) {
+            Throwable cause = status.getCause();
+            String detail = cause != null && cause.getMessage() != null ? cause.getMessage() : status.getDescription();
+            EventLog.w(TAG, what + ": " + code + (detail != null ? " (" + detail + ")" : ""));
+        } else {
+            EventLog.e(TAG, what, t);
+        }
+    }
+
+    /**
+     * The state of the connection to this address, asking it to connect if it is idle -- null if there is no channel to it
+     * (none was made, or it was shut down). Never creates one. Used by PeerLossWatcher.
+     */
+    io.grpc.ConnectivityState connectionState(String ipAddress) {
+        ManagedChannel channel = mChannelPool.get(ipAddress);
+        if (channel == null || channel.isShutdown() || channel.isTerminated()) {
+            return null;
+        }
+        return channel.getState(true);
+    }
+
+    /** Closes every connection to a peer -- the service is paused by its policy. New ones are made when needed. */
+    void closeAllChannels() {
+        for (String ip : new java.util.ArrayList<>(mChannelPool.keySet())) {
+            ManagedChannel channel = mChannelPool.remove(ip);
+            if (channel != null) {
+                channel.shutdownNow();
             }
         }
     }
@@ -235,9 +285,12 @@ final class GrpcTransportEngine {
                         buffer.reset();
                         receivedChunkCount = 0;
                         streamStartNanos = System.nanoTime();
-                        EventLog.i(TAG, "gRPC receiving task envelope [" + (meta.getFileIndex() + 1) + "/"
-                                + meta.getTotalFiles() + "] taskId=" + currentTaskId + " from " + currentSender
-                                + " (" + meta.getFileSize() + " bytes)");
+                        // A sign of life comes every few seconds, from every requestor that holds this device: not worth a line.
+                        if (!HOLD_FILE_NAME_MARKER.equals(currentTaskId)) {
+                            EventLog.i(TAG, "gRPC receiving task envelope [" + (meta.getFileIndex() + 1) + "/"
+                                    + meta.getTotalFiles() + "] taskId=" + currentTaskId + " from " + currentSender
+                                    + " (" + meta.getFileSize() + " bytes)");
+                        }
 
                     } else if (value.hasChunk()) {
                         byte[] chunkBytes = value.getChunk().toByteArray();
@@ -260,17 +313,19 @@ final class GrpcTransportEngine {
                         EventLog.w(TAG, "gRPC stream for taskId=" + currentTaskId + " from " + currentSender
                                 + " was cancelled by the sender");
                     } else {
-                        EventLog.e(TAG, "gRPC task envelope stream error (taskId=" + currentTaskId + ")", t);
+                        logCallFailure("gRPC task envelope stream error (taskId=" + currentTaskId + ")", t);
                     }
                 }
 
                 @Override
                 public void onCompleted() {
                     if (READY_CHECK_FILE_NAME_MARKER.equals(currentTaskId)) {
-                        svc.mReadinessEngine.handleReadyCheckReceived(buffer.toByteArray());
+                        // null = taken up; otherwise why this device cannot be ready for the sender, which the
+                        // sender reads in the reply and reports this device lost (see PeerReadinessEngine.tellPeerLost()).
+                        String refusal = svc.mReadinessEngine.handleReadyCheckReceived(buffer.toByteArray());
                         responseObserver.onNext(TransferResponse.newBuilder()
-                                .setSuccess(true)
-                                .setMessage("Ready check received")
+                                .setSuccess(refusal == null)
+                                .setMessage(refusal == null ? "Ready check received" : refusal)
                                 .build());
                         responseObserver.onCompleted();
                         return;
@@ -281,6 +336,28 @@ final class GrpcTransportEngine {
                         responseObserver.onNext(TransferResponse.newBuilder()
                                 .setSuccess(true)
                                 .setMessage("Ready ack received")
+                                .build());
+                        responseObserver.onCompleted();
+                        return;
+                    }
+
+                    if (WITHDRAW_FILE_NAME_MARKER.equals(currentTaskId)) {
+                        svc.mReadinessEngine.handleWithdrawReceived(currentSender, buffer.toByteArray());
+                        responseObserver.onNext(TransferResponse.newBuilder()
+                                .setSuccess(true)
+                                .setMessage("Withdraw notice received")
+                                .build());
+                        responseObserver.onCompleted();
+                        return;
+                    }
+
+                    if (HOLD_FILE_NAME_MARKER.equals(currentTaskId)) {
+                        // null = this device is reserved for the sender; otherwise it is not (any more), which the sender
+                        // reads in the reply and reports this device lost.
+                        String refusal = svc.mReadinessEngine.handleHoldReceived(currentSender);
+                        responseObserver.onNext(TransferResponse.newBuilder()
+                                .setSuccess(refusal == null)
+                                .setMessage(refusal == null ? "Hold received" : refusal)
                                 .build());
                         responseObserver.onCompleted();
                         return;
@@ -306,22 +383,28 @@ final class GrpcTransportEngine {
                                 + "ms, throughput=" + formatThroughput(buffer.size(), receiveMillis));
                     }
 
+                    // A task from the requestor this device is reserved for is as good a sign of life as a hold.
+                    svc.mReadinessEngine.noteHolderActivity(currentSender);
                     DistinctTaskEnvelope envelope = TaskTransferEngine.unmarshallEnvelope(buffer.toByteArray());
                     boolean success = envelope != null;
+                    String refusal = null;
                     if (success) {
                         // Prints once per received envelope, per the current "just confirm the
                         // transfer works" scope. Real per-task handling happens in
                         // onDataReceived() once that's implemented.
                         EventLog.i(TAG, "gRPC task data received from " + currentSender
                                 + " (taskId=" + envelope.taskId + ")");
-                        svc.mTaskEngine.onDataReceived(envelope);
+                        // null = taken; otherwise why this device cannot process the task, which the sender reads in
+                        // the reply and reports this device lost (see TaskTransferEngine.sendDistinctTask()).
+                        refusal = svc.mTaskEngine.onDataReceived(envelope);
+                        success = refusal == null;
                     } else {
                         EventLog.e(TAG, "Failed to reconstruct DistinctTaskEnvelope from received bytes "
                                 + "(taskId=" + currentTaskId + ")");
                     }
                     responseObserver.onNext(TransferResponse.newBuilder()
                             .setSuccess(success)
-                            .setMessage(success ? "Received" : "Failed to decode envelope")
+                            .setMessage(refusal != null ? refusal : success ? "Received" : "Failed to decode envelope")
                             .build());
                     responseObserver.onCompleted();
                 }

@@ -7,8 +7,11 @@ import android.net.LinkProperties;
 import android.net.Network;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
+import android.os.IBinder;
 import android.os.PowerManager;
 import android.os.RemoteException;
+import android.os.SystemClock;
+import android.util.Log;
 
 import java.io.IOException;
 import java.net.DatagramPacket;
@@ -27,6 +30,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Multicast peer-discovery protocol: joining/leaving the multicast group, the receive loop,
@@ -52,11 +56,21 @@ final class MulticastDiscoveryEngine {
     private static final int ERROR_WIFI_UNAVAILABLE = 1;
     private static final int ERROR_DISCOVERY_SOCKET_UNAVAILABLE = 2;
     private static final int ERROR_MULTICAST_SEND_FAILED = 3;
+    static final int ERROR_SERVICE_PAUSED = 4;
 
     // TODO: derive from real device/role configuration once that exists; 1 = CONTRIBUTOR/REQUESTOR
     // (per Service_AISDK_Distributed_service_basic_flow's nodeRole values) is a reasonable
     // generic default for a peer that hasn't been specifically configured.
     private static final int LOCAL_NODE_ROLE = 1;
+
+    /** How long the peers found by a peer discovery count as fresh: getConnectedPeers() starts a new discovery after this. */
+    static final long PEER_DISCOVERY_AGE_MILLIS = 5_000L;
+
+    // When the last peer discovery was started (SystemClock.elapsedRealtime(); 0 = never), and for which capability and
+    // listener -- see refreshPeersIfExpired().
+    private final AtomicLong mLastPeerDiscoveryMillis = new AtomicLong();
+    private volatile String mLastDiscoveryCapability;
+    private volatile IPeerDiscoveryListener mLastDiscoveryListener;
 
     final ConcurrentHashMap<String, PendingRequest> mPendingRequests = new ConcurrentHashMap<>();
     // Long-lived listeners registered via registerDiscoveryListener(), independent of any single
@@ -65,6 +79,9 @@ final class MulticastDiscoveryEngine {
     private final Object mSocketLock = new Object();
 
     private volatile MulticastSocket mDiscoverySocket;
+    // A Requestor's socket: discovery requests go out from it and the ACKs come back to it. It is NOT joined to the multicast
+    // group -- a Requestor does not listen for other devices' requests (see startRequestSocketLocked()).
+    private volatile MulticastSocket mRequestSocket;
     private volatile WifiManager.MulticastLock mMulticastLock;
     private volatile WifiManager.WifiLock mWifiLock;
     private volatile PowerManager.WakeLock mWakeLock;
@@ -82,6 +99,16 @@ final class MulticastDiscoveryEngine {
 
     void startMulticastListener(Network network) {
         synchronized (mSocketLock) {
+            if (!svc.isServiceActive()) {
+                EventLog.i(TAG, "Not opening the discovery sockets: the service is paused by its policy");
+                return;
+            }
+            if (svc.getServiceMode() != ServiceMode.CONTRIBUTOR) {
+                // Only a Contributor listens for discovery requests. A Requestor is not joined to the group: it only has
+                // what it needs to send its own requests and receive the answers.
+                startRequestSocketLocked(network);
+                return;
+            }
             if (mIsListening.get() && mDiscoverySocket != null && !mDiscoverySocket.isClosed()) {
                 EventLog.i(TAG, "Multicast listener already active on port " + DISCOVERY_PORT + ", skipping re-bind.");
                 return;
@@ -141,35 +168,143 @@ final class MulticastDiscoveryEngine {
         }
     }
 
+    /** Closes everything this device has open for discovery: the listener (Contributor) and the request socket (Requestor). */
     void stopMulticastListener() {
         synchronized (mSocketLock) {
-            mIsListening.set(false);
-            MulticastSocket socket = mDiscoverySocket;
-            mDiscoverySocket = null;
+            stopListenerLocked();
+            stopRequestSocketLocked();
+        }
+    }
 
-            if (socket != null && !socket.isClosed()) {
-                try {
-                    InetAddress group = InetAddress.getByName(MULTICAST_GROUP_ADDRESS);
-                    socket.leaveGroup(new InetSocketAddress(group, DISCOVERY_PORT), null);
-                } catch (Exception ignored) {
-                } finally {
-                    socket.close();
+    /** Leaves the multicast group and closes the listener, with the locks it needed. Caller holds mSocketLock. */
+    private void stopListenerLocked() {
+        mIsListening.set(false);
+        MulticastSocket socket = mDiscoverySocket;
+        mDiscoverySocket = null;
+
+        if (socket != null && !socket.isClosed()) {
+            try {
+                InetAddress group = InetAddress.getByName(MULTICAST_GROUP_ADDRESS);
+                socket.leaveGroup(new InetSocketAddress(group, DISCOVERY_PORT), null);
+            } catch (Exception ignored) {
+            } finally {
+                socket.close();
+            }
+            EventLog.i(TAG, "Multicast listener socket closed.");
+        }
+
+        if (mMulticastLock != null && mMulticastLock.isHeld()) {
+            mMulticastLock.release();
+            mMulticastLock = null;
+        }
+        if (mWifiLock != null && mWifiLock.isHeld()) {
+            mWifiLock.release();
+            mWifiLock = null;
+        }
+        if (mWakeLock != null && mWakeLock.isHeld()) {
+            mWakeLock.release();
+            mWakeLock = null;
+        }
+    }
+
+    /** Closes the Requestor's socket, if there is one. Caller holds mSocketLock. */
+    private void stopRequestSocketLocked() {
+        MulticastSocket socket = mRequestSocket;
+        mRequestSocket = null;
+        if (socket != null && !socket.isClosed()) {
+            socket.close();
+            EventLog.i(TAG, "Discovery request socket closed.");
+        }
+    }
+
+    /**
+     * What a Requestor has open instead of the listener: an ordinary socket on a free port, bound to the Wi-Fi network, NOT
+     * joined to the multicast group. Discovery requests are sent from it to the group, and a contributor answers a request by
+     * sending its ACK to the request's source address and port -- so the ACKs come back to this socket, while the requests of
+     * other devices, which go to the group and port 58231, never reach this device. A Requestor also holds none of the wake,
+     * Wi-Fi and multicast locks the listener needs. Caller holds mSocketLock.
+     */
+    private void startRequestSocketLocked(Network network) {
+        stopListenerLocked();                          // a Requestor does not listen
+        if (!svc.isServiceActive()) {
+            return;                                    // paused by the service policy: nothing is opened
+        }
+        MulticastSocket existing = mRequestSocket;
+        if (existing != null && !existing.isClosed()) {
+            return;
+        }
+        try {
+            MulticastSocket socket = new MulticastSocket((java.net.SocketAddress) null);
+            socket.bind(new InetSocketAddress(0));
+            socket.setReceiveBufferSize(SOCKET_BUFFER_BYTES);
+            network.bindSocket(socket);
+            NetworkInterface nif = getNetworkInterfaceForNetwork(network);
+            if (nif != null) {
+                socket.setNetworkInterface(nif);       // the interface the requests go out of
+            }
+            socket.setTimeToLive(5);
+            mRequestSocket = socket;
+            EventLog.i(TAG, "Requestor mode: not listening for discovery requests; this device's own requests go out from port "
+                    + socket.getLocalPort() + " and the answers come back to it");
+            Thread receiver = new Thread(() -> runRequestReceiveLoop(socket), "SrjanaDiscoveryRequester");
+            receiver.start();
+        } catch (IOException e) {
+            EventLog.e(TAG, "Failed to open the discovery request socket", e);
+        }
+    }
+
+    /**
+     * The service's mode changed (see DistributedService.applicationBound()/applicationUnbound()): a Requestor stops
+     * listening and opens its request socket; a Contributor closes the request socket and starts listening again -- unless it
+     * is reserved, which keeps it undiscoverable until its requestor releases it. Does nothing without Wi-Fi: nothing is open
+     * then, and the next Wi-Fi connection opens what the mode needs (startMulticastListener()).
+     */
+    void applyServiceMode() {
+        synchronized (mSocketLock) {
+            Network network = svc.mWifiNetwork;
+            if (network == null) {
+                return;
+            }
+            if (svc.getServiceMode() == ServiceMode.CONTRIBUTOR) {
+                stopRequestSocketLocked();
+                if (svc.mReadinessEngine.getReservedFor() == null) {
+                    startMulticastListener(network);
                 }
-                EventLog.i(TAG, "Multicast listener socket closed.");
+            } else {
+                startRequestSocketLocked(network);
             }
+        }
+    }
 
-            if (mMulticastLock != null && mMulticastLock.isHeld()) {
-                mMulticastLock.release();
-                mMulticastLock = null;
+    /** The socket a discovery request goes out from: a Requestor's own, opened now if it is not yet; a Contributor's listener. */
+    private MulticastSocket socketForRequest() {
+        synchronized (mSocketLock) {
+            if (svc.getServiceMode() == ServiceMode.CONTRIBUTOR) {
+                return mDiscoverySocket;
             }
-            if (mWifiLock != null && mWifiLock.isHeld()) {
-                mWifiLock.release();
-                mWifiLock = null;
+            MulticastSocket socket = mRequestSocket;
+            Network network = svc.mWifiNetwork;
+            if ((socket == null || socket.isClosed()) && network != null) {
+                startRequestSocketLocked(network);
+                socket = mRequestSocket;
             }
-            if (mWakeLock != null && mWakeLock.isHeld()) {
-                mWakeLock.release();
-                mWakeLock = null;
+            return socket;
+        }
+    }
+
+    /** Receives the ACKs to this device's requests on the Requestor's socket, until it is closed. */
+    private void runRequestReceiveLoop(MulticastSocket socket) {
+        byte[] buffer = new byte[MAX_PACKET_BYTES];
+        while (!socket.isClosed()) {
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+            try {
+                socket.receive(packet);
+            } catch (IOException e) {
+                if (socket.isClosed()) break;
+                EventLog.w(TAG, "Request socket receive exception: " + e.getMessage());
+                continue;
             }
+            handleIncomingPacket(packet);
         }
     }
 
@@ -226,6 +361,14 @@ final class MulticastDiscoveryEngine {
             if (svc.getLocalSerialNumber().equals(serialNumber)) {
                 return;
             }
+            // Only a Contributor answers a discovery request, at any moment: a Requestor is not even listening (see
+            // startRequestSocketLocked()), and one that is still reached -- the mode just changed -- is silent too.
+            ServiceMode mode = svc.getServiceMode();
+            if (mode != ServiceMode.CONTRIBUTOR) {
+                EventLog.i(TAG, "Not answering the discovery request from " + serialNumber + " (req=" + requestId
+                        + "): the service is in " + mode.label + " mode, not Contributor");
+                return;
+            }
             EventLog.i(TAG, "Received MSG from " + serialNumber + " (req=" + requestId + "): " + messageBody);
 
             InetAddress senderAddress = packet.getAddress();
@@ -257,6 +400,9 @@ final class MulticastDiscoveryEngine {
                     // (server.py PEER_FOUND_RE), and the default Event Level (Info) would otherwise
                     // never send it.
                     EventLog.i(TAG, "New peer responded to discovery: " + serialNumber);
+                    // Before the application is told the peer joined: a peer that was reported lost and has answered
+                    // again is not lost any more, so that it is reported again if it fails again.
+                    svc.mReadinessEngine.peerJoined(serialNumber);
                     safeOnPeerJoined(pending.listener, peerInfo);
                 }
             }
@@ -288,6 +434,15 @@ final class MulticastDiscoveryEngine {
      * peer responds, onDiscoveryComplete() with the full list once the window closes.
      */
     void requestPeerDiscovery(String capability, IPeerDiscoveryListener listener) {
+        // Remembered for refreshPeersIfExpired(), which has to start the same discovery again.
+        mLastDiscoveryCapability = capability;
+        mLastDiscoveryListener = listener;
+        mLastPeerDiscoveryMillis.set(SystemClock.elapsedRealtime());
+        if (!svc.isServiceActive()) {
+            EventLog.w(TAG, "Peer discovery refused: the service is paused by its policy");
+            safeOnDiscoveryFailed(listener, capability, ERROR_SERVICE_PAUSED, "The service is paused by its policy");
+            return;
+        }
         if (svc.mWifiNetwork == null) {
             EventLog.w(TAG, "Wi-Fi is not connected. Discovery aborted.");
             safeOnDiscoveryFailed(listener, capability, ERROR_WIFI_UNAVAILABLE, "Wi-Fi is not connected");
@@ -297,7 +452,7 @@ final class MulticastDiscoveryEngine {
     }
 
     private void startMulticastRequest(String capability, IPeerDiscoveryListener listener) {
-        MulticastSocket socket = mDiscoverySocket;
+        MulticastSocket socket = socketForRequest();
         Network network = svc.mWifiNetwork;
 
         if (socket == null || socket.isClosed() || network == null) {
@@ -330,6 +485,19 @@ final class MulticastDiscoveryEngine {
         svc.mScheduler.schedule(() -> completeRequest(requestId), CONFIRMATION_WINDOW_MILLIS, TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * The service is paused by its policy: every discovery still waiting for its window to close is ended, and the
+     * application is told it failed instead of waiting for answers that can no longer come.
+     */
+    void failPendingRequests(int errorCode, String message) {
+        for (String requestId : new ArrayList<>(mPendingRequests.keySet())) {
+            PendingRequest pending = mPendingRequests.remove(requestId);
+            if (pending != null) {
+                safeOnDiscoveryFailed(pending.listener, pending.capability, errorCode, message);
+            }
+        }
+    }
+
     private void completeRequest(String requestId) {
         PendingRequest pending = mPendingRequests.remove(requestId);
         if (pending == null) return;
@@ -339,6 +507,62 @@ final class MulticastDiscoveryEngine {
 
         List<PeerInfo> peers = new ArrayList<>(pending.respondingPeers.values());
         safeOnDiscoveryComplete(pending.listener, pending.capability, peers);
+    }
+
+    /**
+     * The application stopped its peer discovery (NetworkInterfaceServiceImpl.stopPeerDiscovery()): forgets the last
+     * discovery -- its time, capability and listener -- so that getConnectedPeers() no longer starts one again for it
+     * (see refreshPeersIfExpired()). Only when it is the discovery of this capability that was stopped: the application
+     * can run discoveries for more than one capability, and stopping one must not end the refreshing of the last one
+     * started for another.
+     */
+    void clearLastDiscovery(String capability) {
+        String last = mLastDiscoveryCapability;
+        if (last != null && !last.equals(capability)) {
+            return;
+        }
+        mLastDiscoveryCapability = null;
+        mLastDiscoveryListener = null;
+        mLastPeerDiscoveryMillis.set(0);
+    }
+
+    /**
+     * Called whenever the application asks for the connected peers (NetworkInterfaceServiceImpl.getConnectedPeers()):
+     * if the last peer discovery was started PEER_DISCOVERY_AGE_MILLIS ago or more, starts one again -- the same one the
+     * application started last (its capability and listener), so its answers come back the same way, onPeerJoined() and
+     * onDiscoveryComplete(). Does not wait for it: the peers known now are returned by the caller at once. Does nothing
+     * while the last discovery is younger than that, or when the application has not started a discovery yet (there is no
+     * capability or listener to run one for) or is gone.
+     */
+    void refreshPeersIfExpired() {
+        if (!svc.isServiceActive()) {
+            return;                                    // paused by the service policy: no discovery is started
+        }
+        String capability = mLastDiscoveryCapability;
+        IPeerDiscoveryListener listener = mLastDiscoveryListener;
+        if (capability == null || listener == null) {
+            Log.d(TAG, "Capability or Listner is null");
+            return;
+        }
+        IBinder binder = listener.asBinder();
+        if (binder != null && !binder.isBinderAlive()) {
+            Log.d(TAG, "Binder is null");
+            return;                                    // the application that asked is gone
+        }
+        long now = SystemClock.elapsedRealtime();
+        long last = mLastPeerDiscoveryMillis.get();
+        long age = now - last;
+        if (age < PEER_DISCOVERY_AGE_MILLIS) {
+            Log.d(TAG, "Age is not expired");
+            return;
+        }
+        // Several callers may find it expired together: only the one that records the new time starts the discovery.
+        if (!mLastPeerDiscoveryMillis.compareAndSet(last, now)) {
+            return;
+        }
+        EventLog.i(TAG, "The last peer discovery is " + age + " ms old (peer discovery age " + PEER_DISCOVERY_AGE_MILLIS
+                + " ms): starting peer discovery for capability '" + capability + "'");
+        requestPeerDiscovery(capability, listener);
     }
 
     /**
@@ -485,6 +709,16 @@ final class MulticastDiscoveryEngine {
             listener.onPeerReady(peerId);
         } catch (RemoteException e) {
             EventLog.w(TAG, "Remote listener failure in onPeerReady", e);
+        }
+    }
+
+    static void safeOnPeerLost(IPeerDiscoveryListener listener, String peerId) {
+        if (listener == null) return;
+        try {
+            listener.onPeerLost(peerId);
+            EventLog.w(TAG, "onPeerLost :" + peerId);
+        } catch (RemoteException e) {
+            EventLog.w(TAG, "Remote listener failure in onPeerLost", e);
         }
     }
 
