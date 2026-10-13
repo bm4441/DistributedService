@@ -54,9 +54,10 @@ import okhttp3.WebSocketListener;
  * "TC501W" -- as a "product" member next to the "deviceId" the message already has (see ProductName).
  *
  * When the "Performance log" setting is on (see LogConfig; the screen has the switch) it also follows logcat for one
- * tag, "PerformanceMetrics", under which the demo application logs a line per processed frame ("mode=LOCAL fps=1.38
- * peers=4/10 lastMs=1093"), and sends the mode, the frame rate and the last processing time of each as a message of
- * its own: {"type":"perf","source":"PerformanceMetrics","mode":"LOCAL","fps":1.38,"lastMs":1093} (see
+ * tag, "PerformanceMetrics", under which the demo application logs a line per processed frame ("mode=LOCAL
+ * capability=ocr.recognize fps=1.38 peers=4/10 lastMs=1093"), and sends the mode, the frame rate, the last processing
+ * time and the capability of each as a message of its own:
+ * {"type":"perf","source":"PerformanceMetrics","mode":"LOCAL","fps":1.38,"lastMs":1093,"capability":"ocr.recognize"} (see
  * PerformanceMetric, PerfOutbox, LogcatTail). Those lines belong to another application, so reading them needs the
  * READ_LOGS permission -- a normal app only gets it from adb ("adb shell pm grant <package>
  * android.permission.READ_LOGS") -- and, since Android 12, the user's approval of each logcat reader: a question

@@ -31,6 +31,8 @@ final class GrpcTransportEngine {
     static final int CHUNK_SIZE = 64 * 1024;
     static final int FLOW_CONTROL_WINDOW = 4 * 1024 * 1024;
     static final int MAX_MESSAGE_SIZE = 8 * 1024 * 1024;
+    // The longest any send waits: for the stream to become ready again (a peer that stops reading), and for the peer's reply once a message
+    // is sent. A peer that went offline is given up -- and reported lost -- after this long, so it is shown at once and not after a minute.
     static final int GRPC_TIMEOUT_SECONDS = 60;
     static final long READY_POLL_INTERVAL_MILLIS = 5;
     // Sentinel FileMetadata.file_name value marking a "ready check" datagram (see

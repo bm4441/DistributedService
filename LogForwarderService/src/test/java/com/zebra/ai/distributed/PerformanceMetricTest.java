@@ -182,9 +182,46 @@ public class PerformanceMetricTest {
     @Test
     public void theMessage_hasTheModeTheFrameRateAndTheLastMs() {
         assertEquals("{\"type\":\"perf\",\"source\":\"PerformanceMetrics\",\"mode\":\"LOCAL\",\"fps\":1.38,\"lastMs\":1093}",
-                parsed("mode=LOCAL fps=1.38 peers=4/10 lastMs=1093").toJson());
+                parsed("mode=LOCAL fps=1.38 lastMs=1093").toJson());
         assertEquals("{\"type\":\"perf\",\"source\":\"PerformanceMetrics\",\"mode\":\"THROUGHPUT\",\"fps\":0.00,\"lastMs\":730}",
-                parsed("mode=THROUGHPUT fps=0.00 peers=2/10 lastMs=730").toJson());
+                parsed("mode=THROUGHPUT fps=0.00 lastMs=730").toJson());
+    }
+
+    @Test
+    public void theMessage_hasTheCapabilityWhenTheLineHasOne_andNeverThePeers() {
+        assertEquals("{\"type\":\"perf\",\"source\":\"PerformanceMetrics\",\"mode\":\"LOCAL\",\"fps\":39.22,\"lastMs\":45,"
+                        + "\"capability\":\"ocr.recognize\"}",
+                parsed("mode=LOCAL capability=ocr.recognize fps=39.22 peers=0/3 lastMs=45").toJson());
+        // the line as Android Studio's logcat window shows it
+        PerformanceMetric metric = parsed("2026-10-12 17:40:12.185 30957-30957 PerformanceMetrics      com...apture.distributedaisuitedemo  I  "
+                + "mode=LOCAL capability=ocr.recognize fps=39.22 peers=0/3 lastMs=45");
+        assertEquals("ocr.recognize", metric.capability);
+        assertEquals(Long.valueOf(45), metric.lastMs);
+        assertFalse(metric.toJson().contains("peers"));
+    }
+
+    @Test
+    public void aLineWithoutACapability_hasNone_andTheMessageLeavesItOut() {
+        PerformanceMetric metric = parsed("mode=LOCAL fps=3.39 peers=2/10 lastMs=328");
+        assertNull(metric.capability);
+        assertEquals("{\"type\":\"perf\",\"source\":\"PerformanceMetrics\",\"mode\":\"LOCAL\",\"fps\":3.39,\"lastMs\":328}", metric.toJson());
+    }
+
+    @Test
+    public void theCapabilityIsSentAsTheApplicationWroteIt() {
+        // case and spelling are the dashboard's business ("Ocr.Recognise" is "ocr.recognize")
+        assertEquals("Ocr.Recognise", parsed("mode=LOCAL capability=Ocr.Recognise fps=3.39 peers=2/10 lastMs=328").capability);
+        assertEquals("product.embed_lookup", parsed("capability=product.embed_lookup mode=THROUGHPUT fps=1.00 lastMs=9").capability);
+        assertEquals("product.frame", parsed("mode=LOCAL fps=1.00 lastMs=9 capability=product.frame").capability);
+    }
+
+    @Test
+    public void aCapabilityThatCouldBreakTheMessage_orIsNotAWord_isLeftOut() {
+        assertNull(parsed("mode=LOCAL capability=\"ocr fps=1.00 lastMs=1").capability);
+        assertNull(parsed("mode=LOCAL capability=ocr\"} fps=1.00 lastMs=1").capability);
+        assertNull(parsed("mode=LOCAL xcapability=ocr.recognize fps=1.00 lastMs=1").capability);
+        assertNull(parsed("mode=LOCAL capability= fps=1.00 lastMs=1").capability);
+        assertNull("longer than any capability", parsed("mode=LOCAL capability=" + new String(new char[49]).replace('\0', 'a') + " fps=1.00 lastMs=1").capability);
     }
 
     @Test
@@ -197,6 +234,7 @@ public class PerformanceMetricTest {
     @Test
     public void thePeersAreNotSent() {
         assertFalse(parsed("mode=LOCAL fps=1.38 peers=4/10 lastMs=1093").toJson().contains("peers"));
+        assertFalse(parsed("mode=LOCAL capability=ocr.recognize fps=1.38 peers=4/10 lastMs=1093").toJson().contains("peers"));
     }
 
     @Test

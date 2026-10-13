@@ -70,6 +70,9 @@ final class PeerReadinessEngine {
     // Requestor side. Peers reported lost to the application (onPeerLost) and not heard from since -- each is reported once
     // -- and the "peerId|capability" of every ready check whose ready ack is still awaited.
     private final Set<String> mLostPeers = ConcurrentHashMap.newKeySet();
+    // What this device knew of each lost peer (its entry of mKnownDevices, taken out when it was reported lost -- see tellPeerLost()), so
+    // that a peer that turns out to be ready after all (its ready ack comes late) gets its entry back. Cleared with mLostPeers.
+    private final ConcurrentHashMap<String, PeerInfo> mLostPeerInfos = new ConcurrentHashMap<>();
     private final Set<String> mAwaitingReadyAck = ConcurrentHashMap.newKeySet();
 
     // The requestor this device is reserved for -- the one whose ready check it took up first -- or null while it is free. A
@@ -244,6 +247,7 @@ final class PeerReadinessEngine {
         // This requestor's session is over: nothing is awaited from any peer, and none counts as lost any more.
         mAwaitingReadyAck.removeIf(key -> key.endsWith("|" + capability));
         mLostPeers.clear();
+        mLostPeerInfos.clear();
         mLossWatcher.clear();
 
         Set<String> readyPeerIds = mReadyPeersByCapability.remove(capability);
@@ -277,6 +281,7 @@ final class PeerReadinessEngine {
         mReadyPeersByCapability.clear();
         mAwaitingReadyAck.clear();
         mLostPeers.clear();
+        mLostPeerInfos.clear();
         mLossWatcher.clear();
     }
 
@@ -354,8 +359,11 @@ final class PeerReadinessEngine {
                 EventLog.w(TAG, "Skipping a peer with no peerId in getReadyPeers(capability=" + capability + ")");
                 continue;
             }
-            // A new attempt with this peer: if it fails again, the application is told again.
+            // A new attempt with this peer: if it fails again, the application is told again. A peer that was lost has been taken out of
+            // mKnownDevices (see tellPeerLost()); the application asks for it again with its address, so it is known again.
             mLostPeers.remove(peer.peerId);
+            mLostPeerInfos.remove(peer.peerId);
+            svc.mKnownDevices.putIfAbsent(peer.peerId, peer);
             svc.mTaskEngine.ensurePeerWorker(peer.peerId);
             svc.mTransferExecutor.execute(() -> sendReadyCheck(peer, capability));
         }
@@ -489,6 +497,8 @@ final class PeerReadinessEngine {
         }
         if (mLostPeers.contains(peerId)) {
             mLostPeers.remove(peerId);
+            // The answer to the discovery has just put the peer's fresh entry into mKnownDevices: the old one is not needed any more.
+            mLostPeerInfos.remove(peerId);
             EventLog.i(TAG, "Peer " + peerId + ", reported lost before, joined again");
         }
         // Not among the lost peers: nothing to do, the join carries on.
@@ -509,9 +519,29 @@ final class PeerReadinessEngine {
             return;
         }
         EventLog.w(TAG, "Peer " + peerId + " is lost: " + why);
+        forgetLostPeer(peerId);                        // before the application is told: it may ask again at once
         for (IPeerDiscoveryListener listener : svc.mDiscoveryEngine.mRegisteredListeners) {
             MulticastDiscoveryEngine.safeOnPeerLost(listener, peerId);
         }
+    }
+
+    /**
+     * A peer reported lost is not a peer this device holds any more: it is taken out of mKnownDevices and out of the contributors
+     * this device holds (ready, or whose ready ack is awaited). So the release notice that goes to every held contributor when this
+     * session ends (stopPeerDiscovery()), and the holds that go out while it lasts (sendHoldBeats()), do not go to a peer that was
+     * lost. It comes back with a discovery answer (peerJoined()), with the next getReadyPeers() for it, or with a ready ack that
+     * arrives late (onPeerReadyAckReceive()).
+     */
+    private void forgetLostPeer(String peerId) {
+        PeerInfo known = svc.mKnownDevices.remove(peerId);
+        if (known != null) {
+            mLostPeerInfos.put(peerId, known);
+        }
+        for (Set<String> ready : mReadyPeersByCapability.values()) {
+            ready.remove(peerId);
+        }
+        mAwaitingReadyAck.removeIf(key -> key.startsWith(peerId + "|"));
+        EventLog.i(TAG, "Peer " + peerId + " is no longer among the known devices or the contributors this device holds: it gets no release notice");
     }
 
     /**
@@ -791,7 +821,12 @@ final class PeerReadinessEngine {
      * wound down the same way. Blocks while it waits, so not on the main thread.
      */
     void pauseContributorWork() {
-        windDownContributorWork("The service is paused by its policy", "the service is paused by its policy");
+        pauseContributorWork("The service is paused by its policy", "the service is paused by its policy");
+    }
+
+    /** The same, for another reason (the user turned the service off): what it says in the log, and what the requestor that holds it is told. */
+    void pauseContributorWork(String why, String reasonForRequestor) {
+        windDownContributorWork(why, reasonForRequestor);
     }
 
     /**
@@ -1077,6 +1112,10 @@ final class PeerReadinessEngine {
         mAwaitingReadyAck.remove(peerId + "|" + capability);
         if (mLostPeers.remove(peerId)) {
             EventLog.i(TAG, "Peer " + peerId + ", reported lost before, is ready after all");
+            PeerInfo before = mLostPeerInfos.remove(peerId);       // it is a known device again (see tellPeerLost())
+            if (before != null) {
+                svc.mKnownDevices.putIfAbsent(peerId, before);
+            }
         }
         svc.mKnownDevices.computeIfPresent(peerId, (id, info) -> info.withReadiness(true));
         mReadyPeersByCapability.computeIfAbsent(capability, c -> ConcurrentHashMap.newKeySet()).add(peerId);

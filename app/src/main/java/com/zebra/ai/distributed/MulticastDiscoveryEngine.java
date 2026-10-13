@@ -125,7 +125,9 @@ final class MulticastDiscoveryEngine {
 
             WifiManager wifiManager = (WifiManager) svc.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wifiManager != null) {
-                mWifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, TAG + ":WifiLock");
+                // Low-latency mode: the radio stays awake and answers at once, which shortens every task upload and result send.
+                // (WIFI_MODE_FULL_HIGH_PERF is deprecated since API 34 and no longer has an effect.)
+                mWifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, TAG + ":WifiLock");
                 mWifiLock.setReferenceCounted(false);
                 mWifiLock.acquire();
 

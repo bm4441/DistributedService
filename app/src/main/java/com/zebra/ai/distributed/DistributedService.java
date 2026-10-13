@@ -62,6 +62,12 @@ public class DistributedService extends Service {
 
     public static final String PREFS_NAME = "DistributedServicePrefs";
     public static final String KEY_IS_RUNNING = "is_distributed_service_running";
+    /**
+     * Sent to the service (startService) by the screen's "Turn OFF Service": it turns itself off at once, whatever is bound to it. A plain
+     * stopService() does not: Android keeps a service alive for as long as an application is bound to it, and a requestor is bound
+     * for as long as its session lasts.
+     */
+    public static final String ACTION_TURN_OFF = "com.zebra.ai.distributed.TURN_OFF";
 
     private static final String TAG = "DistributedService";
     private static final String GREETING = "Hello, I am a new system service";
@@ -93,7 +99,7 @@ public class DistributedService extends Service {
     // log forwarder, the status sent to the dashboard) so that it can notice the policy being met again.
     // The gate decides (on the scheduler thread) when a verdict has held long enough to act on; the engines are started or
     // stopped on mTransferExecutor, one at a time (mActivationLock), towards what the gate last decided (mWantActive).
-    private final ServicePolicy.Gate mPolicyGate =
+    private ServicePolicy.Gate mPolicyGate =                                    // under mPolicyCheckLock; a new one when the service is turned on again
             new ServicePolicy.Gate(ServicePolicy.START_AFTER_MILLIS, ServicePolicy.STOP_AFTER_MILLIS);
     private volatile boolean mServiceActive;
     private volatile boolean mWantActive;
@@ -101,6 +107,14 @@ public class DistributedService extends Service {
     private final Object mActivationLock = new Object();
     private PowerManager.WakeLock mPolicyWakeLock;                              // under mPolicyCheckLock
     private volatile boolean mDestroyed;
+    // Turned off by the user (see turnOff()): the engines are stopped and the log forwarder is let go while an application may still be
+    // bound, so what onDestroy() does cannot wait for it.
+    private volatile boolean mTurnedOff;
+    private volatile int mTurnOffEpoch;                                        // each turn-off (and each turn-on after one) is a new one
+    private java.util.concurrent.ScheduledFuture<?> mStatusTick;              // the one-second status / policy reading
+    private final Object mReleaseLock = new Object();
+    private boolean mEnginesReleased;                                          // under mReleaseLock
+    private boolean mExecutorsReleased;                                        // under mReleaseLock
 
     // The policy is checked every second (sendDeviceStatus()) and, besides, the moment the battery changes -- a plug, a level, a
     // temperature -- (onBatteryChanged()): a device that is asleep, with its screen off, runs its one-second timer only while it
@@ -177,7 +191,7 @@ public class DistributedService extends Service {
         // binding is reported by onBind(), right after this).
         logServiceMode("the service started; no application is bound");
         // From the start, so the dashboard knows this device's name at once (starting the SDK below can take a while).
-        mScheduler.scheduleWithFixedDelay(this::sendDeviceStatus, 0, DEVICE_MESSAGE_PERIOD_SECONDS, TimeUnit.SECONDS);
+        mStatusTick = mScheduler.scheduleWithFixedDelay(this::sendDeviceStatus, 0, DEVICE_MESSAGE_PERIOD_SECONDS, TimeUnit.SECONDS);
         registerBatteryReceiver();
         initializeLenderHandlers();
     }
@@ -231,6 +245,13 @@ public class DistributedService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && ACTION_TURN_OFF.equals(intent.getAction())) {
+            turnOff();
+            return START_NOT_STICKY;
+        }
+        if (mTurnedOff) {
+            turnOnAgain();                               // "Turn ON" while an application kept the turned-off service alive
+        }
         setServiceRunningState(this, true);
 
         Notification notification = buildNotification();
@@ -263,6 +284,9 @@ public class DistributedService extends Service {
     @Nullable
     @Override
     public IBinder onBind(Intent intent) {
+        if (mTurnedOff) {
+            return null;                               // switched off by the user: nothing new binds to it
+        }
         applicationBound();
         return mNetworkInterfaceBinder;
     }
@@ -356,6 +380,34 @@ public class DistributedService extends Service {
     public void onDestroy() {
         super.onDestroy();
         mDestroyed = true;
+        releaseEverything(true);
+    }
+
+    /**
+     * "Turn OFF Service": the whole service goes off now -- the engines, the notification, and the log forwarder -- even while an
+     * application is bound to it (a requestor is, for as long as its session lasts; Android would keep the service alive for it and
+     * onDestroy() would not come).  In this order: the screen is told and the notification removed at once; what the service is doing
+     * is stopped the way a policy pause stops it -- the contributors it holds are released, the tasks it accepted are finished, its
+     * application is told its tasks and discoveries will not complete (pauseEngines()); the log forwarder is let go (it flushes to the
+     * dashboard and stops: its process is bound to this one only); and the service ends (stopSelf()).  An application that is still
+     * bound stays bound to a service that refuses everything, until it unbinds -- then onDestroy() frees the last threads.
+     * Runs the slow part off the main thread: finishing the accepted tasks can take a while.
+     */
+    private void turnOff() {
+        if (mTurnedOff) {
+            return;
+        }
+        mTurnedOff = true;
+        final int epoch = ++mTurnOffEpoch;
+        EventLog.w(TAG, "The service is turned off by the user" + (mOpenBindings > 0
+                ? " -- an application is still bound to it: it is told its work will not complete, and the service ends when it unbinds"
+                : ""));
+        setServiceRunningState(this, false);
+        broadcastState(false);                          // the screen shows STOPPED at once
+        stopForeground(STOP_FOREGROUND_REMOVE);         // ... and the notification goes
+        if (mStatusTick != null) {
+            mStatusTick.cancel(false);                  // nothing reads the policy any more: it must not start the engines again
+        }
         if (mBatteryReceiver != null) {
             try {
                 unregisterReceiver(mBatteryReceiver);
@@ -364,45 +416,113 @@ public class DistributedService extends Service {
             }
             mBatteryReceiver = null;
         }
-        broadcastState(false);
-        setServiceRunningState(this, false);
-
-        if (mConnectivityManager != null) {
+        Thread thread = new Thread(() -> {
             try {
-                mConnectivityManager.unregisterNetworkCallback(mWifiNetworkCallback);
-            } catch (Exception ignored) {}
-            mConnectivityManager = null;
+                synchronized (mActivationLock) {
+                    mWantActive = false;
+                    if (mServiceActive) {
+                        pauseEngines("The service is turned off by the user", "The service is turned off by the user", "the service is turned off by the user");
+                    }
+                }
+                if (epoch == mTurnOffEpoch) {                // (not if the user turned it on again meanwhile)
+                    releaseEverything(false);
+                }
+            } catch (RuntimeException e) {
+                EventLog.e(TAG, "Turning the service off failed half-way", e);
+            } finally {
+                if (epoch == mTurnOffEpoch) {
+                    stopSelf();                          // (an application still bound keeps it alive until it unbinds)
+                }
+            }
+        }, "TurnOff");
+        thread.start();
+    }
+
+    /**
+     * "Turn ON Service" reached a service that was turned off but kept alive by an application that stayed bound: it takes up what the
+     * turn-off let go of -- the log forwarder, the battery receiver, the status reading -- and carries on as a new start (onStartCommand()
+     * then registers the Wi-Fi callback again).  Its engines start when its policy has held for a few seconds, as after any start.
+     */
+    private void turnOnAgain() {
+        mTurnOffEpoch++;
+        synchronized (mReleaseLock) {
+            mEnginesReleased = false;
         }
+        mTurnedOff = false;
+        synchronized (mPolicyCheckLock) {
+            // The old gate still thinks the engines run (it decided so before the turn-off): a fresh one judges the policy from scratch,
+            // and its first verdict acts at once.
+            mPolicyGate = new ServicePolicy.Gate(ServicePolicy.START_AFTER_MILLIS, ServicePolicy.STOP_AFTER_MILLIS);
+            mWantActive = false;
+        }
+        EventLog.init(this);
+        EventLog.i(TAG, "The service is turned on again");
+        registerBatteryReceiver();
+        mStatusTick = mScheduler.scheduleWithFixedDelay(this::sendDeviceStatus, 0, DEVICE_MESSAGE_PERIOD_SECONDS, TimeUnit.SECONDS);
+    }
 
-        mDiscoveryEngine.stopMulticastListener();
-        mGrpcEngine.stopTransferServer();
+    /**
+     * Everything the service holds, let go once: the network callback, the discovery sockets, the gRPC server and connections, the
+     * peer, processing and result threads, the models -- and last the log forwarder, which gets the final events, flushes to the
+     * dashboard and stops.  Called when the service is turned off (destroying = false: its executors stay, for an application that
+     * is still bound and is refused politely) and from onDestroy() (destroying = true: they go too); each part runs only once.
+     */
+    private void releaseEverything(boolean destroying) {
+        synchronized (mReleaseLock) {
+            if (destroying && !mExecutorsReleased) {
+                mExecutorsReleased = true;
+                mScheduler.shutdownNow();
+                mOutboundExecutor.shutdownNow();
+                mTransferExecutor.shutdownNow();
+            }
+            if (mEnginesReleased) {
+                return;
+            }
+            mEnginesReleased = true;
+            if (mBatteryReceiver != null) {
+                try {
+                    unregisterReceiver(mBatteryReceiver);
+                } catch (IllegalArgumentException ignored) {
+                    // Never registered.
+                }
+                mBatteryReceiver = null;
+            }
+            broadcastState(false);
+            setServiceRunningState(this, false);
 
-        mScheduler.shutdownNow();
-        mOutboundExecutor.shutdownNow();
-        mTransferExecutor.shutdownNow();
-        mTaskEngine.shutdownPeerWorkers(0);
-        mTaskEngine.shutdownProcessingThread();
-        mResultEngine.shutdownResultTransferThread();
+            if (mConnectivityManager != null) {
+                try {
+                    mConnectivityManager.unregisterNetworkCallback(mWifiNetworkCallback);
+                } catch (Exception ignored) {}
+                mConnectivityManager = null;
+            }
 
-        // Same as PeerReadinessEngine.releaseCapability(): removed first, then disposed under the
-        // handler's lock, so an in-progress handle()/prepare() finishes before its model is freed.
-        for (String capability : mReadinessEngine.mLenderHandlers.keySet()) {
-            LenderHandler handler = mReadinessEngine.mLenderHandlers.remove(capability);
-            if (handler != null) {
-                synchronized (handler) {
-                    try {
-                        handler.dispose();
-                    } catch (Exception e) {
-                        EventLog.w(TAG, "Error disposing LenderHandler", e);
+            mDiscoveryEngine.stopMulticastListener();
+            mGrpcEngine.stopTransferServer();
+            mTaskEngine.shutdownPeerWorkers(0);
+            mTaskEngine.shutdownProcessingThread();
+            mResultEngine.shutdownResultTransferThread();
+
+            // Same as PeerReadinessEngine.releaseCapability(): removed first, then disposed under the
+            // handler's lock, so an in-progress handle()/prepare() finishes before its model is freed.
+            for (String capability : mReadinessEngine.mLenderHandlers.keySet()) {
+                LenderHandler handler = mReadinessEngine.mLenderHandlers.remove(capability);
+                if (handler != null) {
+                    synchronized (handler) {
+                        try {
+                            handler.dispose();
+                        } catch (Exception e) {
+                            EventLog.w(TAG, "Error disposing LenderHandler", e);
+                        }
                     }
                 }
             }
-        }
 
-        EventLog.i(TAG, "DistributedService destroyed and stopped.");
-        // Last: delivers the final events to the forwarder, then unbinds it so it flushes to the
-        // server and stops.
-        EventLog.shutdown();
+            EventLog.i(TAG, "DistributedService destroyed and stopped.");
+            // Last: delivers the final events to the forwarder, then unbinds it so it flushes to the
+            // server and stops.
+            EventLog.shutdown();
+        }
     }
 
     private void broadcastState(boolean isRunning) {
@@ -437,7 +557,7 @@ public class DistributedService extends Service {
 
     /** Shows the service's state in its notification -- paused, with the reason, or active. */
     private void updateNotification() {
-        if (mDestroyed) {
+        if (mDestroyed || mTurnedOff) {
             return;                                    // the notification goes with the service; do not bring it back
         }
         NotificationManager manager = getSystemService(NotificationManager.class);
@@ -602,13 +722,15 @@ public class DistributedService extends Service {
                 try {
                     synchronized (mActivationLock) {
                         boolean want = mWantActive;
-                        if (mDestroyed || want == mServiceActive) {
+                        if (mDestroyed || mTurnedOff || want == mServiceActive) {
                             return;
                         }
                         if (want) {
                             startEngines();
                         } else {
-                            pauseEngines();
+                            ServicePolicy.Decision decision = mPolicyDecision;
+                            pauseEngines("Service policy NOT met: the service pauses" + (decision != null ? " (" + decision.summary + ")" : ""),
+                                    "The service is paused by its policy", "the service is paused by its policy");
                         }
                     }
                 } finally {
@@ -640,7 +762,7 @@ public class DistributedService extends Service {
      * (driveServiceByPolicy() holds the CPU while a change is pending). Several changes close together are one check.
      */
     private void onBatteryChanged() {
-        if (mDestroyed || !mPolicyCheckQueued.compareAndSet(false, true)) {
+        if (mDestroyed || mTurnedOff || !mPolicyCheckQueued.compareAndSet(false, true)) {
             return;
         }
         PowerManager.WakeLock lock = acquireWorkLock("BatteryEvent", BATTERY_EVENT_WAKE_LOCK_MILLIS);
@@ -710,16 +832,15 @@ public class DistributedService extends Service {
      * tasks it had accepted are completed and their results sent; what this device was waiting for as a requestor is
      * ended and its callers told; then the gRPC server and the connections close.
      */
-    private void pauseEngines() {
+    private void pauseEngines(String logLine, String why, String reason) {
         mServiceActive = false;
         mActiveSinceMillis = System.currentTimeMillis();
-        ServicePolicy.Decision decision = mPolicyDecision;
-        EventLog.w(TAG, "Service policy NOT met: the service pauses" + (decision != null ? " (" + decision.summary + ")" : ""));
+        EventLog.w(TAG, logLine);
         updateNotification();
 
         mDiscoveryEngine.stopMulticastListener();
-        mDiscoveryEngine.failPendingRequests(MulticastDiscoveryEngine.ERROR_SERVICE_PAUSED, "The service is paused by its policy");
-        mReadinessEngine.pauseContributorWork();                 // as a Contributor: finish what was accepted, tell its requestor
+        mDiscoveryEngine.failPendingRequests(MulticastDiscoveryEngine.ERROR_SERVICE_PAUSED, why);
+        mReadinessEngine.pauseContributorWork(why, reason);      // as a Contributor: finish what was accepted, tell its requestor
         mTaskEngine.shutdownPeerWorkers(2000);                   // as a Requestor: uploads stop ...
         mReadinessEngine.releaseHeldPeersAndForget();            // ... the contributors it holds are released ...
         mResultEngine.cancelAllTaskGroups();                     // ... and the application is told its tasks will not complete

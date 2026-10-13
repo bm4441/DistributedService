@@ -14,6 +14,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
+import android.view.KeyCharacterMap;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
@@ -86,6 +88,12 @@ public class MainActivity extends AppCompatActivity {
     // Set by "Turn ON Service" while the performance log is on: leave the screen as soon as log access is allowed.
     private boolean mLeaveWhenAllowed = false;
     private final Runnable mLeaveRunnable = this::leaveScreen;
+    // The Zebra scanner (DataWedge keystroke output): what it types is told from what a person types (see ScanCapture, handleScannerKey()).
+    private final ScanCapture mScan = new ScanCapture();
+    private final Runnable mScanFinishRunnable = this::finishScan;
+    // The address field as it was when the scan began: put back if the scanned code is not a server address.
+    private String mFieldBeforeScan = "";
+    private int mSelectionBeforeScan = 0;
     // The saved log settings (see LogConfig) as of the last change made on this screen.
     private LogConfig.Settings mSettings;
 
@@ -211,6 +219,8 @@ public class MainActivity extends AppCompatActivity {
     protected void onPause() {
         super.onPause();
         mHandler.removeCallbacks(mRefreshRunnable);
+        mHandler.removeCallbacks(mScanFinishRunnable);
+        mScan.reset();
     }
 
     @Override
@@ -275,8 +285,16 @@ public class MainActivity extends AppCompatActivity {
         mHandler.removeCallbacks(mLeaveRunnable);
         updateUIState(false);
 
+        // A plain stopService() would leave the service running while an application is bound to it -- a requestor is, for as long as
+        // its session lasts. The service is told to turn itself off instead: it releases what it holds, lets go of the log forwarder
+        // (so both services go off), removes its notification and ends. Without a session it is destroyed at once, as before.
         Intent serviceIntent = new Intent(this, DistributedService.class);
-        stopService(serviceIntent);
+        try {
+            startService(serviceIntent.setAction(DistributedService.ACTION_TURN_OFF));
+        } catch (IllegalStateException e) {
+            Log.w(TAG, "Could not send the turn-off command; stopping the service the plain way", e);
+            stopService(new Intent(this, DistributedService.class));
+        }
 
         Toast.makeText(this, "DistributedService stopped.", Toast.LENGTH_SHORT).show();
     }
@@ -506,6 +524,95 @@ public class MainActivity extends AppCompatActivity {
         }
         saveSettings(mSettings.logPrint, mSettings.eventLevel, address, mSettings.perfLog);
         Toast.makeText(this, "Log server address applied.", Toast.LENGTH_SHORT).show();
+    }
+
+    /* ================= Zebra scanner: scan the dashboard's QR code to set the address and turn the service on ================= */
+
+    /**
+     * Sees every key event the screen gets (the Zebra scanner's DataWedge profile types what it scans as key events, into the field
+     * that has the focus -- or into nothing, if none does) and picks out a scan: a run of characters that comes in a few
+     * milliseconds, where a person takes a tenth of a second per key (see ScanCapture). A person's typing, the soft keyboard, the Apply
+     * button and the Done key are not touched: only what is taken for a scan is handled here, and only its Enter is swallowed.
+     */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        return handleScannerKey(event) || super.dispatchKeyEvent(event);
+    }
+
+    /** True if the event belongs to a scan and is not to go on to the field or a button. */
+    private boolean handleScannerKey(KeyEvent event) {
+        long now = event.getEventTime();
+        int code = event.getKeyCode();
+        int action = event.getAction();
+        if (action == KeyEvent.ACTION_MULTIPLE && code == KeyEvent.KEYCODE_UNKNOWN && event.getCharacters() != null
+                && event.getCharacters().length() >= ScanCapture.MIN_CHARS) {
+            // The whole text in one event: nothing is typed into the field, the scan is read from here.
+            if (mScan.onChunk(event.getCharacters(), now)) {
+                rememberFieldBeforeScan();
+            }
+            scheduleScanFinish();
+            return true;
+        }
+        if (code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER) {
+            // The Enter a scanner can add after the code: it must not press the button that has the focus, or apply a half-finished field.
+            return mScan.takesEnter(now);
+        }
+        if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
+                && !event.isCtrlPressed() && !event.isAltPressed() && !event.isMetaPressed()) {
+            int unicode = event.getUnicodeChar();
+            if (unicode >= 0x20 && unicode != 0x7F && unicode <= 0xFFFF && (unicode & KeyCharacterMap.COMBINING_ACCENT) == 0) {
+                if (mScan.onChar((char) unicode, now)) {
+                    rememberFieldBeforeScan();           // (before this character reaches the field)
+                }
+                scheduleScanFinish();
+                // The key goes on to the field as it always did; if it turns out to be part of a scan, the field is set (or put back) below.
+            }
+        }
+        return false;
+    }
+
+    private void rememberFieldBeforeScan() {
+        mFieldBeforeScan = etServerAddress.getText().toString();
+        mSelectionBeforeScan = etServerAddress.getSelectionStart();
+    }
+
+    private void scheduleScanFinish() {
+        mHandler.removeCallbacks(mScanFinishRunnable);
+        mHandler.postDelayed(mScanFinishRunnable, ScanCapture.SETTLE_MILLIS + 25);
+    }
+
+    /**
+     * The scanner has gone quiet. If what it typed was a scan:
+     *   - a log server address -> it replaces what the field had (the old address, and whatever of the scan was typed into it), is
+     *     applied the way the Apply button does, and the service is turned on (as "Turn ON Service" does) unless it is on already;
+     *   - anything else -> the field is put back as it was, with an error: the old address is kept.
+     * If it was a person typing, nothing is done.
+     */
+    private void finishScan() {
+        String scanned = mScan.finish(SystemClock.uptimeMillis());
+        if (scanned == null) {
+            if (!mScan.isEmpty()) {
+                scheduleScanFinish();                    // not over yet: look again
+            }
+            return;
+        }
+        String address = ScannedAddress.parse(scanned);
+        if (address == null) {
+            etServerAddress.setText(mFieldBeforeScan);
+            etServerAddress.setSelection(Math.max(0, Math.min(mSelectionBeforeScan, mFieldBeforeScan.length())));
+            String message = "The scanned code is not a log server address. Scan the dashboard's QR code (ws://<PC address>:5000/logs).";
+            etServerAddress.setError(message);
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+            Log.w(TAG, "Scanned a code that is not a log server address (" + scanned.length() + " characters): the address is unchanged");
+            return;
+        }
+        Log.i(TAG, "Scanned the log server address " + address);
+        etServerAddress.setText(address);
+        etServerAddress.setError(null);
+        applyServerAddress();
+        if (!mCurrentRunningState) {
+            startDistributedServiceAndExit();
+        }
     }
 
     private void requestNotificationPermission() {

@@ -7,11 +7,15 @@ import java.util.regex.Pattern;
  * One line of the demo application's performance log -- logcat tag "PerformanceMetrics", written once per
  * processed frame -- and the message the log forwarder sends the dashboard server for it:
  *
- *   log line:  mode=LOCAL fps=1.38 peers=4/10 lastMs=1093
- *   message:   {"type":"perf","source":"PerformanceMetrics","mode":"LOCAL","fps":1.38,"lastMs":1093}
+ *   log line:  mode=LOCAL capability=ocr.recognize fps=1.38 peers=4/10 lastMs=1093
+ *   message:   {"type":"perf","source":"PerformanceMetrics","mode":"LOCAL","fps":1.38,"lastMs":1093,
+ *               "capability":"ocr.recognize"}
  *
- * Only the mode, the frame rate and the last processing time are sent ("peers" is not). Before the first result
- * the application leaves lastMs out ("mode=LOCAL fps=0.00 peers=4/10"): the line is still sent, with lastMs null.
+ * The mode, the frame rate and the last processing time are always sent. The capability (what the application is
+ * running: it names the dashboard's session even while the application runs Local) is sent when the line has it (a
+ * line without it, from an application that does not write it, gives the message it always gave). "peers" is not
+ * sent. Before the first result the application leaves lastMs out ("mode=LOCAL fps=0.00 peers=4/10"): the line is still
+ * sent, with lastMs null.
  *
  * The line is found by its "key=value" words wherever they are in the text, so it does not matter which logcat
  * format the line comes in -- the bare text, "I/PerformanceMetrics( 4983): mode=...", the threadtime style with
@@ -34,17 +38,22 @@ final class PerformanceMetric {
     private static final Pattern MODE = Pattern.compile("(?:^|\\s)mode=([A-Za-z0-9_.\\-]{1,32})(?=\\s|$)");
     private static final Pattern FPS = Pattern.compile("(?:^|\\s)fps=(-?\\d+(?:[.,]\\d+)?)(?=\\s|$)");
     private static final Pattern LAST_MS = Pattern.compile("(?:^|\\s)lastMs=(-?\\d+(?:[.,]\\d+)?)(?=\\s|$)");
+    // "capability=ocr.recognize" (or "Ocr.Recognise": the dashboard takes no notice of case or spelling).
+    private static final Pattern CAPABILITY = Pattern.compile("(?:^|\\s)capability=([A-Za-z0-9_.\\-]{1,48})(?=\\s|$)");
 
     /** LOCAL, THROUGHPUT, ... exactly as the application wrote it. */
     final String mode;
     final double fps;
     /** The last processing time in milliseconds; null if the line had none yet. */
     final Long lastMs;
+    /** What the application is running ("ocr.recognize") exactly as it wrote it; null if the line has none. */
+    final String capability;
 
-    private PerformanceMetric(String mode, double fps, Long lastMs) {
+    private PerformanceMetric(String mode, double fps, Long lastMs, String capability) {
         this.mode = mode;
         this.fps = fps;
         this.lastMs = lastMs;
+        this.capability = capability;
     }
 
     /** The metric in a logcat line, or null if the line is not a performance line (a banner, other output, damaged). */
@@ -62,7 +71,8 @@ final class PerformanceMetric {
         if (last.find()) {
             lastMs = Math.round(number(last.group(1)));
         }
-        return new PerformanceMetric(mode.group(1), number(fps.group(1)), lastMs);
+        Matcher capability = CAPABILITY.matcher(line);
+        return new PerformanceMetric(mode.group(1), number(fps.group(1)), lastMs, capability.find() ? capability.group(1) : null);
     }
 
     private static double number(String text) {
@@ -82,11 +92,15 @@ final class PerformanceMetric {
         } else {
             json.nul();
         }
+        if (capability != null) {
+            json.key("capability").str(capability);
+        }
         return json.endObject().toString();
     }
 
     @Override
     public String toString() {
-        return "mode=" + mode + " fps=" + fps + " lastMs=" + (lastMs != null ? lastMs : "-");
+        return "mode=" + mode + (capability != null ? " capability=" + capability : "") + " fps=" + fps
+                + " lastMs=" + (lastMs != null ? lastMs : "-");
     }
 }
